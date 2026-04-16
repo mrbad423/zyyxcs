@@ -1,37 +1,75 @@
 import sys
+import os
 import time
-import ssl
 import socket
+import ssl
 import ipaddress
-import urllib.request
-import concurrent.futures
 import threading
-from datetime import datetime
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PySide6.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton, QLineEdit,
-    QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QHeaderView, QTextEdit, QFileDialog, QMessageBox, QProgressBar
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QPushButton, QTextEdit, QFileDialog,
+    QVBoxLayout, QHBoxLayout, QLineEdit, QMessageBox, QSpinBox, QTableWidget,
+    QTableWidgetItem, QHeaderView, QCheckBox
 )
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont, QColor
-
 
 TEST_HOST = "speed.cloudflare.com"
-DEFAULT_URL = "https://zip.cm.edu.kg/all.txt"
+DOWNLOAD_PATH = "/__down?bytes=50000000"
 
 
-def parse_ip_port_line(line: str, default_port: int = 443):
+def format_ip_port(ip: str, port: int) -> str:
+    """格式化 IP:端口，IPv6 自动加 []"""
+    if ":" in ip:
+        return f"[{ip}]:{port}"
+    return f"{ip}:{port}"
+
+
+def split_countries(country_text: str):
+    """
+    解析国家代码输入框，如:
+    HK,JP,SG,TW,US
+    """
+    if not country_text.strip():
+        return []
+    parts = country_text.replace("，", ",").split(",")
+    result = []
+    seen = set()
+    for part in parts:
+        code = part.strip().upper()
+        if code and code not in seen:
+            seen.add(code)
+            result.append(code)
+    return result
+
+
+def parse_ip_port_country_line(line: str, default_port: int = 443):
+    """
+    支持格式：
+    1.1.1.1
+    1.1.1.1:443
+    1.1.1.1:443#HK
+    1.1.1.1#HK
+    [2606:4700::1111]:443#TW
+    2606:4700::1111#JP
+    """
     line = line.strip()
     if not line:
         return None
 
+    country = "UNKNOWN"
+
+    # 提取国家代码
     if "#" in line:
-        line = line.split("#", 1)[0].strip()
+        line_part, country_part = line.split("#", 1)
+        line = line_part.strip()
+        country = country_part.strip().upper() if country_part.strip() else "UNKNOWN"
+
     if not line:
         return None
 
+    # 处理 [IPv6]:port
     if line.startswith("[") and "]" in line:
         try:
             host_part, rest = line.split("]", 1)
@@ -40,34 +78,33 @@ def parse_ip_port_line(line: str, default_port: int = 443):
             if rest.startswith(":"):
                 port = int(rest[1:].strip())
             ipaddress.ip_address(ip)
-            return {"ip": ip, "port": port}
+            return {"ip": ip, "port": port, "country": country}
         except Exception:
             return None
 
-    if line.count(":") == 1 and "." in line:
+    # 尝试纯 IP（IPv4 / IPv6）
+    try:
+        ipaddress.ip_address(line)
+        return {"ip": line, "port": default_port, "country": country}
+    except Exception:
+        pass
+
+    # 尝试 IPv4:port
+    if ":" in line:
         try:
             ip, port = line.rsplit(":", 1)
             ip = ip.strip()
             port = int(port.strip())
             ipaddress.ip_address(ip)
-            return {"ip": ip, "port": port}
+            return {"ip": ip, "port": port, "country": country}
         except Exception:
             return None
 
-    try:
-        ipaddress.ip_address(line)
-        return {"ip": line, "port": default_port}
-    except Exception:
-        return None
+    return None
 
 
-def format_ip_port(ip: str, port: int):
-    if ":" in ip:
-        return f"[{ip}]:{port}"
-    return f"{ip}:{port}"
-
-
-def tcp_ping(ip: str, port: int, timeout: float = 1.5):
+def tcp_ping(ip: str, port: int, timeout=1.5):
+    """TCP 延迟测试，返回毫秒"""
     start = time.time()
     try:
         if ":" in ip:
@@ -76,95 +113,16 @@ def tcp_ping(ip: str, port: int, timeout: float = 1.5):
             sock = socket.socket(family, socktype, proto)
             sock.settimeout(timeout)
             sock.connect(sockaddr)
-            sock.close()
         else:
             sock = socket.create_connection((ip, port), timeout=timeout)
-            sock.close()
+        sock.close()
         return round((time.time() - start) * 1000, 2)
     except Exception:
         return None
 
 
-def get_iata_code_from_ip(ip: str, timeout: int = 3):
-    test_host = "speed.cloudflare.com"
-
-    if ":" in ip:
-        urls = [
-            f"https://[{ip}]/cdn-cgi/trace",
-            f"http://[{ip}]/cdn-cgi/trace",
-        ]
-    else:
-        urls = [
-            f"https://{ip}/cdn-cgi/trace",
-            f"http://{ip}/cdn-cgi/trace",
-        ]
-
-    for url in urls:
-        try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-            if url.startswith("https://"):
-                use_ssl = True
-                host = url[8:].split("/")[0].strip("[]")
-            else:
-                use_ssl = False
-                host = url[7:].split("/")[0].strip("[]")
-
-            port = 443 if use_ssl else 80
-
-            if ":" in host:
-                addrinfo = socket.getaddrinfo(host, port, socket.AF_INET6, socket.SOCK_STREAM)
-                family, socktype, proto, canonname, sockaddr = addrinfo[0]
-                s = socket.socket(family, socktype, proto)
-                s.settimeout(timeout)
-                s.connect(sockaddr)
-            else:
-                s = socket.create_connection((host, port), timeout=timeout)
-
-            if use_ssl:
-                s = ctx.wrap_socket(s, server_hostname=test_host)
-
-            request = (
-                "GET /cdn-cgi/trace HTTP/1.1\r\n"
-                f"Host: {test_host}\r\n"
-                "User-Agent: Mozilla/5.0\r\n"
-                "Connection: close\r\n\r\n"
-            ).encode()
-
-            s.sendall(request)
-
-            data = b""
-            body = b""
-            while True:
-                try:
-                    chunk = s.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
-                    if b"\r\n\r\n" in data:
-                        header_end = data.find(b"\r\n\r\n")
-                        body = data[header_end + 4:]
-                        break
-                except socket.timeout:
-                    break
-
-            s.close()
-
-            response_text = body.decode("utf-8", errors="ignore")
-            for line in response_text.splitlines():
-                if line.startswith("colo="):
-                    colo_value = line.split("=", 1)[1].strip()
-                    if colo_value and colo_value.upper() != "UNKNOWN":
-                        return colo_value.upper()
-        except Exception:
-            continue
-
-    return None
-
-
-def speed_test_single(ip: str, port: int, stop_event: threading.Event):
+def speed_test_single(ip: str, port: int, country: str, stop_event: threading.Event):
+    """单个节点测速"""
     latency = tcp_ping(ip, port, timeout=1.5)
 
     ctx = ssl.create_default_context()
@@ -172,7 +130,7 @@ def speed_test_single(ip: str, port: int, stop_event: threading.Event):
     ctx.verify_mode = ssl.CERT_NONE
 
     req = (
-        "GET /__down?bytes=50000000 HTTP/1.1\r\n"
+        f"GET {DOWNLOAD_PATH} HTTP/1.1\r\n"
         f"Host: {TEST_HOST}\r\n"
         "User-Agent: Mozilla/5.0\r\n"
         "Accept: */*\r\n"
@@ -191,455 +149,336 @@ def speed_test_single(ip: str, port: int, stop_event: threading.Event):
             sock = socket.create_connection((ip, port), timeout=3)
 
         ss = ctx.wrap_socket(sock, server_hostname=TEST_HOST)
+        ss.settimeout(3)
         ss.sendall(req)
 
         start = time.time()
-        data = b""
+        header_data = b""
         header_done = False
         body_size = 0
 
         while time.time() - start < 3:
             if stop_event.is_set():
                 break
-            buf = ss.recv(8192)
-            if not buf:
+            try:
+                buf = ss.recv(8192)
+                if not buf:
+                    break
+                if not header_done:
+                    header_data += buf
+                    if b"\r\n\r\n" in header_data:
+                        header_done = True
+                        body = header_data.split(b"\r\n\r\n", 1)[1]
+                        body_size += len(body)
+                else:
+                    body_size += len(buf)
+            except socket.timeout:
                 break
-            if not header_done:
-                data += buf
-                if b"\r\n\r\n" in data:
-                    header_done = True
-                    body_size += len(data.split(b"\r\n\r\n", 1)[1])
-            else:
-                body_size += len(buf)
 
         ss.close()
         duration = time.time() - start
         speed = round((body_size / 1024 / 1024) / max(duration, 0.1), 2)
-
     except Exception:
         speed = 0.0
-
-    colo = get_iata_code_from_ip(ip, timeout=3)
 
     return {
         "ip": ip,
         "port": port,
+        "country": country,
         "latency": latency if latency is not None else 9999.0,
         "download_speed": speed,
-        "iata": colo if colo else "UNKNOWN"
     }
 
 
-def split_regions(region_text: str):
-    if not region_text.strip():
-        return []
-    parts = region_text.replace("，", ",").split(",")
-    result = []
-    seen = set()
-    for part in parts:
-        code = part.strip().upper()
-        if code and code not in seen:
-            seen.add(code)
-            result.append(code)
-    return result
-
-
-def export_grouped_by_region(results, regions, topn_each):
+def export_grouped_by_country(results, countries, topn_each):
+    """按国家分组，并取每个国家前 N"""
     grouped = defaultdict(list)
 
     for item in results:
-        iata = item.get("iata", "UNKNOWN").upper()
-        if regions and iata not in regions:
+        country = item.get("country", "UNKNOWN").upper()
+        if countries and country not in countries:
             continue
-        grouped[iata].append(item)
+        grouped[country].append(item)
 
     export_items = []
+    target_countries = countries if countries else sorted(grouped.keys())
 
-    target_regions = regions if regions else sorted(grouped.keys())
-
-    for region in target_regions:
-        items = grouped.get(region, [])
+    for country in target_countries:
+        items = grouped.get(country, [])
         items.sort(key=lambda x: x["download_speed"], reverse=True)
-
         if topn_each > 0:
             items = items[:topn_each]
-
         export_items.extend(items)
 
     return export_items
 
 
 class SpeedTestWorker(QThread):
-    progress = Signal(int, int)
-    log = Signal(str)
-    finished_result = Signal(list)
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    result_signal = pyqtSignal(dict)
+    finished_signal = pyqtSignal(list)
 
-    def __init__(self, url: str, default_port: int, max_count: int, concurrency: int):
+    def __init__(self, file_path, default_port=443, threads=20):
         super().__init__()
-        self.url = url.strip()
+        self.file_path = file_path
         self.default_port = default_port
-        self.max_count = max_count
-        self.concurrency = concurrency
+        self.threads = threads
         self.stop_event = threading.Event()
 
     def stop(self):
         self.stop_event.set()
 
-    def fetch_txt(self):
-        req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.read().decode("utf-8", errors="ignore").splitlines()
-
     def run(self):
-        results = []
-        try:
-            self.log.emit(f"开始下载: {self.url}")
-            lines = self.fetch_txt()
+        if not os.path.exists(self.file_path):
+            self.log.emit("文件不存在。")
+            self.finished_signal.emit([])
+            return
 
-            parsed = []
-            seen = set()
-
-            for line in lines:
-                item = parse_ip_port_line(line, self.default_port)
+        targets = []
+        with open(self.file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                item = parse_ip_port_country_line(line, self.default_port)
                 if item:
-                    key = f"{item['ip']}:{item['port']}"
-                    if key not in seen:
-                        seen.add(key)
-                        parsed.append(item)
+                    targets.append(item)
 
-            if not parsed:
-                self.log.emit("未解析到有效 IP")
-                self.finished_result.emit([])
-                return
+        if not targets:
+            self.log.emit("没有解析到可测速的 IP。")
+            self.finished_signal.emit([])
+            return
 
-            self.log.emit(f"解析到 {len(parsed)} 个目标")
-            targets = parsed[:min(self.max_count, len(parsed))]
-            self.log.emit(f"开始并发测速 {len(targets)} 个目标，并发数: {self.concurrency}")
+        self.log.emit(f"已加载 {len(targets)} 个目标，开始测速...")
+        results = []
+        completed = 0
 
-            completed = 0
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            future_map = {
+                executor.submit(
+                    speed_test_single,
+                    item["ip"],
+                    item["port"],
+                    item["country"],
+                    self.stop_event
+                ): item
+                for item in targets
+            }
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-                future_map = {
-                    executor.submit(speed_test_single, item["ip"], item["port"], self.stop_event): item
-                    for item in targets
-                }
+            for future in as_completed(future_map):
+                if self.stop_event.is_set():
+                    self.log.emit("测速已停止。")
+                    break
 
-                for future in concurrent.futures.as_completed(future_map):
-                    if self.stop_event.is_set():
-                        self.log.emit("用户已停止测速")
-                        break
+                try:
+                    result = future.result()
+                    results.append(result)
+                    self.result_signal.emit(result)
 
-                    item = future_map[future]
                     completed += 1
-
-                    try:
-                        result = future.result()
-                        results.append(result)
-                        self.log.emit(
-                            f"[{completed}/{len(targets)}] {format_ip_port(result['ip'], result['port'])} | "
-                            f"{result['iata']} | {result['download_speed']:.2f} MB/s"
-                        )
-                    except Exception as e:
-                        self.log.emit(
-                            f"[{completed}/{len(targets)}] {format_ip_port(item['ip'], item['port'])} 测速失败: {e}"
-                        )
-
                     self.progress.emit(completed, len(targets))
+                    self.log.emit(
+                        f"[{completed}/{len(targets)}] "
+                        f"{format_ip_port(result['ip'], result['port'])} | "
+                        f"{result['country']} | "
+                        f"{result['latency']:.2f} ms | "
+                        f"{result['download_speed']:.2f} MB/s"
+                    )
+                except Exception as e:
+                    completed += 1
+                    self.progress.emit(completed, len(targets))
+                    self.log.emit(f"[{completed}/{len(targets)}] 测速异常: {e}")
 
-            results.sort(key=lambda x: x["download_speed"], reverse=True)
-            self.finished_result.emit(results)
-
-        except Exception as e:
-            self.log.emit(f"发生错误: {e}")
-            self.finished_result.emit(results)
+        results.sort(key=lambda x: x["download_speed"], reverse=True)
+        self.finished_signal.emit(results)
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TXT 并发测速工具 - 最终增强版")
-        self.resize(1120, 780)
+        self.setWindowTitle("按TXT国家代码分国家测速工具")
+        self.resize(1100, 760)
 
-        self.worker = None
+        self.file_path = ""
         self.results = []
+        self.worker = None
 
         self.init_ui()
 
     def init_ui(self):
-        font = QFont("Microsoft YaHei", 10)
-        main = QVBoxLayout(self)
+        layout = QVBoxLayout()
 
-        title = QLabel("TXT 并发测速工具 - 最终增强版")
-        title.setAlignment(Qt.AlignCenter)
-        title.setFont(QFont("Microsoft YaHei", 18, QFont.Bold))
-        main.addWidget(title)
-
+        # 文件选择
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("TXT链接:"))
-        self.url_input = QLineEdit(DEFAULT_URL)
-        self.url_input.setFont(font)
-        row1.addWidget(self.url_input)
-        main.addLayout(row1)
+        self.file_edit = QLineEdit()
+        self.file_edit.setPlaceholderText("请选择TXT文件...")
+        btn_browse = QPushButton("选择文件")
+        btn_browse.clicked.connect(self.choose_file)
+        row1.addWidget(QLabel("TXT文件:"))
+        row1.addWidget(self.file_edit)
+        row1.addWidget(btn_browse)
+        layout.addLayout(row1)
 
+        # 参数设置
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("默认端口:"))
-        self.port_input = QLineEdit("443")
-        self.port_input.setFixedWidth(80)
+
+        self.port_input = QSpinBox()
+        self.port_input.setRange(1, 65535)
+        self.port_input.setValue(443)
+
+        self.thread_input = QSpinBox()
+        self.thread_input.setRange(1, 500)
+        self.thread_input.setValue(20)
+
+        self.country_input = QLineEdit()
+        self.country_input.setPlaceholderText("留空=导出全部国家，例如：HK,JP,SG,TW,US")
+
+        self.topn_input = QSpinBox()
+        self.topn_input.setRange(0, 100000)
+        self.topn_input.setValue(10)
+        self.topn_input.setToolTip("每个国家导出前N条，0表示全部导出")
+
+        row2.addWidget(QLabel("默认端口(仅TXT未写端口时使用):"))
         row2.addWidget(self.port_input)
+        row2.addSpacing(10)
 
-        row2.addSpacing(15)
+        row2.addWidget(QLabel("线程数:"))
+        row2.addWidget(self.thread_input)
+        row2.addSpacing(10)
 
-        row2.addWidget(QLabel("测速数量:"))
-        self.count_input = QLineEdit("50")
-        self.count_input.setFixedWidth(80)
-        row2.addWidget(self.count_input)
+        row2.addWidget(QLabel("筛选国家:"))
+        row2.addWidget(self.country_input)
+        row2.addSpacing(10)
 
-        row2.addSpacing(15)
+        row2.addWidget(QLabel("每国前N条:"))
+        row2.addWidget(self.topn_input)
 
-        row2.addWidget(QLabel("并发数:"))
-        self.concurrency_input = QLineEdit("10")
-        self.concurrency_input.setFixedWidth(80)
-        row2.addWidget(self.concurrency_input)
+        layout.addLayout(row2)
 
-        row2.addStretch()
-
-        self.btn_start = QPushButton("开始测速")
-        self.btn_start.clicked.connect(self.start_test)
-        row2.addWidget(self.btn_start)
-
-        self.btn_stop = QPushButton("停止")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self.stop_test)
-        row2.addWidget(self.btn_stop)
-
-        main.addLayout(row2)
-
+        # 按钮
         row3 = QHBoxLayout()
-        row3.addWidget(QLabel("导出地区码:"))
-        self.export_regions_input = QLineEdit()
-        self.export_regions_input.setPlaceholderText("如 HKG,SIN,NRT；留空=全部地区")
-        self.export_regions_input.setMinimumWidth(260)
-        row3.addWidget(self.export_regions_input)
+        self.btn_start = QPushButton("开始测速")
+        self.btn_stop = QPushButton("停止")
+        self.btn_export = QPushButton("导出结果")
+        self.btn_clear = QPushButton("清空结果")
 
-        row3.addSpacing(15)
+        self.btn_start.clicked.connect(self.start_test)
+        self.btn_stop.clicked.connect(self.stop_test)
+        self.btn_export.clicked.connect(self.export_results)
+        self.btn_clear.clicked.connect(self.clear_results)
 
-        row3.addWidget(QLabel("每个地区前N个:"))
-        self.export_topn_input = QLineEdit("10")
-        self.export_topn_input.setFixedWidth(100)
-        row3.addWidget(self.export_topn_input)
-
-        row3.addStretch()
-
-        self.btn_export = QPushButton("导出TXT")
-        self.btn_export.setEnabled(False)
-        self.btn_export.clicked.connect(self.export_txt)
+        row3.addWidget(self.btn_start)
+        row3.addWidget(self.btn_stop)
         row3.addWidget(self.btn_export)
+        row3.addWidget(self.btn_clear)
+        layout.addLayout(row3)
 
-        main.addLayout(row3)
-
-        self.progress = QProgressBar()
-        self.progress.setValue(0)
-        main.addWidget(self.progress)
-
-        self.status = QLabel("就绪")
-        main.addWidget(self.status)
-
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setMaximumHeight(180)
-        main.addWidget(self.log_box)
-
-        self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["排名", "IP", "端口", "地区码", "延迟(ms)", "速度(MB/s)"])
+        # 结果表格
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["IP", "端口", "国家代码", "延迟(ms)", "速度(MB/s)"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        main.addWidget(self.table)
+        layout.addWidget(self.table)
+
+        # 日志
+        self.log_edit = QTextEdit()
+        self.log_edit.setReadOnly(True)
+        layout.addWidget(QLabel("运行日志:"))
+        layout.addWidget(self.log_edit)
+
+        self.setLayout(layout)
+
+    def choose_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择TXT文件", "", "Text Files (*.txt);;All Files (*)")
+        if path:
+            self.file_path = path
+            self.file_edit.setText(path)
 
     def append_log(self, text):
-        self.log_box.append(text)
+        self.log_edit.append(text)
+
+    def add_result_row(self, item):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        self.table.setItem(row, 0, QTableWidgetItem(item["ip"]))
+        self.table.setItem(row, 1, QTableWidgetItem(str(item["port"])))
+        self.table.setItem(row, 2, QTableWidgetItem(item["country"]))
+        self.table.setItem(row, 3, QTableWidgetItem(f"{item['latency']:.2f}"))
+        self.table.setItem(row, 4, QTableWidgetItem(f"{item['download_speed']:.2f}"))
 
     def start_test(self):
-        url = self.url_input.text().strip()
-        if not url:
-            QMessageBox.warning(self, "提示", "请输入 TXT 链接")
-            return
-
-        try:
-            port = int(self.port_input.text().strip())
-            if not (1 <= port <= 65535):
-                raise ValueError
-        except Exception:
-            QMessageBox.warning(self, "提示", "默认端口无效")
-            return
-
-        try:
-            count = int(self.count_input.text().strip())
-            if not (1 <= count <= 5000):
-                raise ValueError
-        except Exception:
-            QMessageBox.warning(self, "提示", "测速数量无效，范围 1-5000")
-            return
-
-        try:
-            concurrency = int(self.concurrency_input.text().strip())
-            if not (1 <= concurrency <= 200):
-                raise ValueError
-        except Exception:
-            QMessageBox.warning(self, "提示", "并发数无效，范围 1-200")
+        file_path = self.file_edit.text().strip()
+        if not file_path:
+            QMessageBox.warning(self, "提示", "请先选择TXT文件。")
             return
 
         self.results = []
         self.table.setRowCount(0)
-        self.log_box.clear()
-        self.progress.setValue(0)
-        self.status.setText("测速中...")
+        self.log_edit.clear()
+
+        default_port = self.port_input.value()
+        threads = self.thread_input.value()
+
+        self.worker = SpeedTestWorker(file_path, default_port, threads)
+        self.worker.log.connect(self.append_log)
+        self.worker.result_signal.connect(self.on_result)
+        self.worker.finished_signal.connect(self.on_finished)
+        self.worker.start()
 
         self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.btn_export.setEnabled(False)
-
-        self.worker = SpeedTestWorker(url, port, count, concurrency)
-        self.worker.progress.connect(self.update_progress)
-        self.worker.log.connect(self.append_log)
-        self.worker.finished_result.connect(self.on_finished)
-        self.worker.start()
+        self.append_log("开始测速...")
 
     def stop_test(self):
         if self.worker:
             self.worker.stop()
-            self.append_log("正在停止任务...")
-            self.status.setText("正在停止...")
+            self.append_log("正在停止测速...")
 
-    def update_progress(self, current, total):
-        if total > 0:
-            self.progress.setValue(int(current * 100 / total))
-        self.status.setText(f"测速中 {current}/{total}")
+    def on_result(self, item):
+        self.results.append(item)
+        self.add_result_row(item)
 
     def on_finished(self, results):
         self.results = results
-        self.progress.setValue(100 if results else 0)
-        self.status.setText(f"完成，共 {len(results)} 条结果")
         self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self.btn_export.setEnabled(bool(results))
-        self.fill_table(results)
+        self.append_log(f"测速完成，共得到 {len(results)} 条结果。")
 
-    def fill_table(self, results):
+    def clear_results(self):
+        self.results = []
         self.table.setRowCount(0)
+        self.log_edit.clear()
 
-        for idx, item in enumerate(results, 1):
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-
-            latency_text = f"{item['latency']:.2f}" if item["latency"] != 9999.0 else "N/A"
-            values = [
-                str(idx),
-                item["ip"],
-                str(item["port"]),
-                item["iata"],
-                latency_text,
-                f"{item['download_speed']:.2f}",
-            ]
-
-            for col, val in enumerate(values):
-                table_item = QTableWidgetItem(val)
-                table_item.setTextAlignment(Qt.AlignCenter)
-
-                if col == 4 and item["latency"] != 9999.0:
-                    if item["latency"] < 100:
-                        table_item.setForeground(QColor("#16A34A"))
-                    elif item["latency"] < 200:
-                        table_item.setForeground(QColor("#D97706"))
-                    else:
-                        table_item.setForeground(QColor("#DC2626"))
-
-                if col == 5:
-                    speed = item["download_speed"]
-                    if speed >= 20:
-                        table_item.setForeground(QColor("#16A34A"))
-                    elif speed >= 10:
-                        table_item.setForeground(QColor("#D97706"))
-                    else:
-                        table_item.setForeground(QColor("#DC2626"))
-
-                self.table.setItem(row, col, table_item)
-
-    def export_txt(self):
+    def export_results(self):
         if not self.results:
-            QMessageBox.information(self, "提示", "没有结果可导出")
+            QMessageBox.warning(self, "提示", "没有可导出的结果。")
             return
 
-        regions = split_regions(self.export_regions_input.text().strip())
+        countries = split_countries(self.country_input.text())
+        topn_each = self.topn_input.value()
 
-        topn_text = self.export_topn_input.text().strip()
-        if not topn_text:
-            topn_each = 0
-        else:
-            try:
-                topn_each = int(topn_text)
-                if topn_each < 0:
-                    raise ValueError
-            except ValueError:
-                QMessageBox.warning(self, "提示", "每个地区前N个必须是大于等于0的数字")
-                return
-
-        export_items = export_grouped_by_region(self.results, regions, topn_each)
+        export_items = export_grouped_by_country(self.results, countries, topn_each)
 
         if not export_items:
-            QMessageBox.information(self, "提示", "筛选后没有可导出的结果")
+            QMessageBox.warning(self, "提示", "没有符合筛选条件的结果。")
             return
 
-        if regions:
-            self.append_log(f"导出地区: {', '.join(regions)}")
-        else:
-            self.append_log("导出地区: 全部地区")
-
-        if topn_each > 0:
-            self.append_log(f"每个地区各导出前 {topn_each} 个最快节点")
-        else:
-            self.append_log("每个地区导出全部节点")
-
-        default_name = "speed_results"
-        if regions:
-            default_name += "_" + "_".join(regions)
-        else:
-            default_name += "_ALL"
-
-        if topn_each > 0:
-            default_name += f"_eachTop{topn_each}"
-
-        default_name += f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-
-        path, _ = QFileDialog.getSaveFileName(
+        save_path, _ = QFileDialog.getSaveFileName(
             self,
-            "导出TXT",
-            default_name,
+            "保存结果",
+            "country_speed_result.txt",
             "Text Files (*.txt)"
         )
-        if not path:
+        if not save_path:
             return
 
-        if not path.lower().endswith(".txt"):
-            path += ".txt"
+        with open(save_path, "w", encoding="utf-8") as f:
+            for item in export_items:
+                ip_port = format_ip_port(item["ip"], item["port"])
+                line = f"{ip_port}#{item['country']}+{item['download_speed']:.2f}MB/s"
+                f.write(line + "\n")
 
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                for item in export_items:
-                    ip_port = format_ip_port(item["ip"], item["port"])
-                    line = f"{ip_port}#{item['iata']}+{item['download_speed']:.2f}MB/s"
-                    f.write(line + "\n")
-
-            self.append_log(f"导出完成，共写入 {len(export_items)} 条")
-            QMessageBox.information(self, "成功", f"已导出到:\n{path}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"导出失败:\n{e}")
+        QMessageBox.information(self, "完成", f"已导出 {len(export_items)} 条结果到：\n{save_path}")
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
-    sys.exit(app.exec())
+    sys.exit(app.exec_())
