@@ -7,13 +7,14 @@ import ipaddress
 import threading
 import re
 import base64
+import json
 from urllib.parse import urlparse, quote
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QTextEdit, QFileDialog,
     QVBoxLayout, QHBoxLayout, QLineEdit, QMessageBox, QSpinBox, QCheckBox,
@@ -96,7 +97,6 @@ def parse_ip_port_country_line(line: str, default_port: int = 443):
     if not line:
         return None
 
-    # URL
     if "://" in line:
         try:
             parsed = urlparse(line)
@@ -122,7 +122,6 @@ def parse_ip_port_country_line(line: str, default_port: int = 443):
         except Exception:
             return None
 
-    # [IPv6]:port
     if line.startswith("[") and "]" in line:
         try:
             host_part, rest = line.split("]", 1)
@@ -141,7 +140,6 @@ def parse_ip_port_country_line(line: str, default_port: int = 443):
         except Exception:
             return None
 
-    # 纯IP
     try:
         ipaddress.ip_address(line)
         return {
@@ -154,7 +152,6 @@ def parse_ip_port_country_line(line: str, default_port: int = 443):
     except Exception:
         pass
 
-    # IPv4:port / 域名:port
     if ":" in line:
         try:
             host, port = line.rsplit(":", 1)
@@ -178,7 +175,6 @@ def parse_ip_port_country_line(line: str, default_port: int = 443):
         except Exception:
             return None
 
-    # 域名
     try:
         ip = socket.gethostbyname(line)
         return {
@@ -310,24 +306,109 @@ def build_export_text(items):
     return "\n".join(lines) + "\n"
 
 
-def upload_to_webdav(base_url: str, remote_dir: str, filename: str, content: bytes, username: str, password: str):
+def normalize_webdav_url(url: str):
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if not url.lower().endswith("/webdav"):
+        url += "/webdav"
+    return url
+
+
+def build_webdav_url(base_url: str, remote_dir: str, filename: str = None):
     base_url = base_url.strip().rstrip("/")
-    remote_dir = remote_dir.strip().strip("/")
-    filename_encoded = quote(filename)
+    parts = []
 
     if remote_dir:
-        full_url = f"{base_url}/{remote_dir}/{filename_encoded}"
-    else:
-        full_url = f"{base_url}/{filename_encoded}"
+        parts.extend([quote(p) for p in remote_dir.strip("/").split("/") if p.strip()])
+
+    if filename is not None:
+        parts.append(quote(filename))
+
+    if parts:
+        return base_url + "/" + "/".join(parts)
+    return base_url
+
+
+def test_webdav_propfind(base_url: str, username: str, password: str, verify_ssl: bool = True):
+    auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
+
+    req = Request(base_url.rstrip("/"), method="PROPFIND")
+    req.add_header("Authorization", f"Basic {auth}")
+    req.add_header("Depth", "0")
+    req.add_header("User-Agent", "Mozilla/5.0")
+
+    context = None
+    if not verify_ssl:
+        context = ssl._create_unverified_context()
+
+    try:
+        with urlopen(req, timeout=20, context=context) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            return True, f"PROPFIND成功: HTTP {resp.status}\n{body}"
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        return False, f"PROPFIND失败: HTTP {e.code} {e.reason}\n{body}"
+    except URLError as e:
+        return False, f"连接失败: {e}"
+
+
+def upload_to_webdav(base_url: str, remote_dir: str, filename: str, content: bytes,
+                     username: str, password: str, verify_ssl: bool = True):
+    full_url = build_webdav_url(base_url, remote_dir, filename)
+    auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
 
     req = Request(full_url, data=content, method="PUT")
-    auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
     req.add_header("Authorization", f"Basic {auth}")
     req.add_header("Content-Type", "text/plain; charset=utf-8")
     req.add_header("Content-Length", str(len(content)))
+    req.add_header("User-Agent", "Mozilla/5.0")
+    req.add_header("Connection", "close")
 
-    with urlopen(req, timeout=30) as resp:
-        return resp.status, full_url
+    context = None
+    if not verify_ssl:
+        context = ssl._create_unverified_context()
+
+    try:
+        with urlopen(req, timeout=30, context=context) as resp:
+            body = ""
+            try:
+                body = resp.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            return {
+                "status": resp.status,
+                "url": full_url,
+                "body": body
+            }
+
+    except HTTPError as e:
+        error_body = ""
+        headers = ""
+        try:
+            error_body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        try:
+            headers = str(e.headers)
+        except Exception:
+            pass
+
+        raise Exception(
+            f"WebDAV上传失败\n"
+            f"HTTP状态码: {e.code}\n"
+            f"原因: {e.reason}\n"
+            f"URL: {full_url}\n"
+            f"响应头:\n{headers}\n"
+            f"响应内容:\n{error_body}"
+        )
+
+    except URLError as e:
+        raise Exception(f"WebDAV连接失败\nURL: {full_url}\n错误: {e}")
 
 
 class LoadUrlWorker(QThread):
@@ -483,8 +564,15 @@ class MainWindow(QWidget):
         self.worker = None
         self.url_loader = None
 
+        self._loading_settings = False
+        self.settings = QSettings("mrbad423", "advanced_country_speed_gui")
+
         self.init_ui()
         self.apply_styles()
+        self.load_settings()
+        self.bind_auto_save()
+
+        QTimer.singleShot(0, self.auto_reload_last_source)
 
     def init_ui(self):
         main_layout = QVBoxLayout()
@@ -496,7 +584,6 @@ class MainWindow(QWidget):
         title.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(title)
 
-        # 导入设置
         import_group = QGroupBox("导入设置")
         import_layout = QVBoxLayout()
 
@@ -553,7 +640,6 @@ class MainWindow(QWidget):
         import_group.setLayout(import_layout)
         main_layout.addWidget(import_group)
 
-        # 国家选择
         country_group = QGroupBox("国家选择")
         country_main_layout = QVBoxLayout()
 
@@ -587,7 +673,6 @@ class MainWindow(QWidget):
         country_group.setLayout(country_main_layout)
         main_layout.addWidget(country_group)
 
-        # 导出设置
         export_group = QGroupBox("导出设置")
         export_layout = QVBoxLayout()
 
@@ -601,7 +686,7 @@ class MainWindow(QWidget):
 
         export_row2 = QHBoxLayout()
         self.webdav_url_edit = QLineEdit()
-        self.webdav_url_edit.setPlaceholderText("WebDAV地址，例如：https://dav.example.com/dav")
+        self.webdav_url_edit.setPlaceholderText("WebDAV地址，例如：https://dav.example.com/webdav")
         export_row2.addWidget(QLabel("WebDAV地址:"))
         export_row2.addWidget(self.webdav_url_edit)
         export_layout.addLayout(export_row2)
@@ -612,10 +697,16 @@ class MainWindow(QWidget):
         self.webdav_pass_edit = QLineEdit()
         self.webdav_pass_edit.setPlaceholderText("WebDAV密码")
         self.webdav_pass_edit.setEchoMode(QLineEdit.Password)
+
+        self.toggle_password_btn = QPushButton("显示密码")
+        self.toggle_password_btn.setCheckable(True)
+        self.toggle_password_btn.clicked.connect(self.toggle_password_visibility)
+
         export_row3.addWidget(QLabel("用户名:"))
         export_row3.addWidget(self.webdav_user_edit)
         export_row3.addWidget(QLabel("密码:"))
         export_row3.addWidget(self.webdav_pass_edit)
+        export_row3.addWidget(self.toggle_password_btn)
         export_layout.addLayout(export_row3)
 
         export_row4 = QHBoxLayout()
@@ -628,7 +719,6 @@ class MainWindow(QWidget):
         export_group.setLayout(export_layout)
         main_layout.addWidget(export_group)
 
-        # 操作
         action_group = QGroupBox("操作")
         action_layout = QVBoxLayout()
 
@@ -636,6 +726,7 @@ class MainWindow(QWidget):
         self.btn_latency = QPushButton("延迟测试")
         self.btn_speed = QPushButton("测速")
         self.btn_stop = QPushButton("停止")
+        self.btn_test_webdav = QPushButton("测试WebDAV")
         self.btn_export = QPushButton("导出到本地")
         self.btn_export_webdav = QPushButton("导出到WebDAV")
         self.btn_clear = QPushButton("清空结果")
@@ -643,6 +734,7 @@ class MainWindow(QWidget):
         self.btn_latency.clicked.connect(self.start_latency_test)
         self.btn_speed.clicked.connect(self.start_speed_test)
         self.btn_stop.clicked.connect(self.stop_test)
+        self.btn_test_webdav.clicked.connect(self.test_webdav_connection)
         self.btn_export.clicked.connect(self.export_results_local)
         self.btn_export_webdav.clicked.connect(self.export_results_webdav)
         self.btn_clear.clicked.connect(self.clear_results)
@@ -652,6 +744,7 @@ class MainWindow(QWidget):
         row_action.addWidget(self.btn_latency)
         row_action.addWidget(self.btn_speed)
         row_action.addWidget(self.btn_stop)
+        row_action.addWidget(self.btn_test_webdav)
         row_action.addWidget(self.btn_export)
         row_action.addWidget(self.btn_export_webdav)
         row_action.addWidget(self.btn_clear)
@@ -671,7 +764,6 @@ class MainWindow(QWidget):
         action_group.setLayout(action_layout)
         main_layout.addWidget(action_group)
 
-        # 日志
         log_group = QGroupBox("运行日志")
         log_layout = QVBoxLayout()
         self.log_edit = QTextEdit()
@@ -755,6 +847,85 @@ class MainWindow(QWidget):
             }
         """)
 
+    def bind_auto_save(self):
+        self.file_edit.textChanged.connect(self.save_settings)
+        self.url_edit.textChanged.connect(self.save_settings)
+        self.country_input.textChanged.connect(self.save_settings)
+        self.country_search_edit.textChanged.connect(self.save_settings)
+        self.export_name_edit.textChanged.connect(self.save_settings)
+        self.webdav_url_edit.textChanged.connect(self.save_settings)
+        self.webdav_user_edit.textChanged.connect(self.save_settings)
+        self.webdav_pass_edit.textChanged.connect(self.save_settings)
+        self.webdav_dir_edit.textChanged.connect(self.save_settings)
+        self.port_input.valueChanged.connect(self.save_settings)
+        self.thread_input.valueChanged.connect(self.save_settings)
+        self.topn_input.valueChanged.connect(self.save_settings)
+
+    def load_settings(self):
+        self._loading_settings = True
+        try:
+            geometry = self.settings.value("window/geometry")
+            if geometry:
+                self.restoreGeometry(geometry)
+
+            self.file_edit.setText(self.settings.value("import/file_path", ""))
+            self.url_edit.setText(self.settings.value("import/url", ""))
+            self.port_input.setValue(self.settings.value("import/default_port", 443, type=int))
+            self.thread_input.setValue(self.settings.value("test/threads", 20, type=int))
+            self.country_input.setText(self.settings.value("export/countries", ""))
+            self.topn_input.setValue(self.settings.value("export/topn_each", 10, type=int))
+            self.country_search_edit.setText(self.settings.value("country/search", ""))
+            self.export_name_edit.setText(self.settings.value("export/filename", "export_result.txt"))
+            self.webdav_url_edit.setText(self.settings.value("webdav/url", ""))
+            self.webdav_user_edit.setText(self.settings.value("webdav/username", ""))
+            self.webdav_pass_edit.setText(self.settings.value("webdav/password", ""))
+            self.webdav_dir_edit.setText(self.settings.value("webdav/remote_dir", ""))
+        finally:
+            self._loading_settings = False
+
+    def save_country_selection(self):
+        if self._loading_settings:
+            return
+        selected = [country for country, cb in self.country_checkboxes.items() if cb.isChecked()]
+        self.settings.setValue("country/selected", json.dumps(selected, ensure_ascii=False))
+
+    def restore_country_selection(self):
+        saved = self.settings.value("country/selected", "[]")
+        try:
+            selected = set(json.loads(saved))
+        except Exception:
+            selected = set()
+
+        if not self.country_checkboxes:
+            return
+
+        if not selected:
+            for cb in self.country_checkboxes.values():
+                cb.setChecked(True)
+            return
+
+        for country, cb in self.country_checkboxes.items():
+            cb.setChecked(country in selected)
+
+    def save_settings(self):
+        if self._loading_settings:
+            return
+
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("import/file_path", self.file_edit.text().strip())
+        self.settings.setValue("import/url", self.url_edit.text().strip())
+        self.settings.setValue("import/default_port", self.port_input.value())
+        self.settings.setValue("test/threads", self.thread_input.value())
+        self.settings.setValue("export/countries", self.country_input.text().strip())
+        self.settings.setValue("export/topn_each", self.topn_input.value())
+        self.settings.setValue("country/search", self.country_search_edit.text().strip())
+        self.settings.setValue("export/filename", self.export_name_edit.text().strip())
+        self.settings.setValue("webdav/url", self.webdav_url_edit.text().strip())
+        self.settings.setValue("webdav/username", self.webdav_user_edit.text().strip())
+        self.settings.setValue("webdav/password", self.webdav_pass_edit.text())
+        self.settings.setValue("webdav/remote_dir", self.webdav_dir_edit.text().strip())
+        self.save_country_selection()
+
     def append_log(self, text):
         self.log_edit.append(text)
 
@@ -770,6 +941,57 @@ class MainWindow(QWidget):
         self.progress_bar.setMaximum(total if total > 0 else 1)
         self.progress_bar.setValue(current)
         self.progress_label.setText(f"进度：{current}/{total}")
+
+    def toggle_password_visibility(self):
+        if self.toggle_password_btn.isChecked():
+            self.webdav_pass_edit.setEchoMode(QLineEdit.Normal)
+            self.toggle_password_btn.setText("隐藏密码")
+        else:
+            self.webdav_pass_edit.setEchoMode(QLineEdit.Password)
+            self.toggle_password_btn.setText("显示密码")
+
+    def auto_reload_last_source(self):
+        file_path = self.file_edit.text().strip()
+        url = self.url_edit.text().strip()
+
+        if file_path and os.path.exists(file_path):
+            self.append_log(f"启动时自动重新加载上次本地文件：{file_path}")
+            ok = self.load_targets_from_file(file_path)
+            if ok:
+                self.append_log(f"本地文件自动加载完成，共解析到 {len(self.all_targets)} 个目标。")
+                self.set_status("已自动加载上次本地TXT")
+                return
+            else:
+                self.append_log("上次本地文件自动加载失败。")
+
+        if url and (url.startswith("http://") or url.startswith("https://")):
+            self.append_log(f"启动时自动重新加载上次 URL：{url}")
+            self.set_status("正在自动加载上次URL")
+            self.url_loader = LoadUrlWorker(url)
+            self.url_loader.log.connect(self.append_log)
+            self.url_loader.finished_signal.connect(self.on_auto_url_loaded)
+            self.url_loader.start()
+
+    def on_auto_url_loaded(self, success, content):
+        if not success:
+            self.append_log(f"上次URL自动加载失败：{content}")
+            self.set_status("自动加载上次URL失败")
+            return
+
+        self.all_targets = []
+        for line in content.splitlines():
+            item = parse_ip_port_country_line(line, self.port_input.value())
+            if item:
+                self.all_targets.append(item)
+
+        if not self.all_targets:
+            self.append_log("上次URL内容中没有解析到可用目标。")
+            self.set_status("上次URL无可用内容")
+            return
+
+        self.build_country_checkboxes()
+        self.append_log(f"上次URL自动加载完成，共解析到 {len(self.all_targets)} 个目标。")
+        self.set_status("已自动加载上次URL")
 
     def choose_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择TXT文件", "", "Text Files (*.txt);;All Files (*)")
@@ -855,10 +1077,14 @@ class MainWindow(QWidget):
         for idx, country in enumerate(countries):
             checkbox = QCheckBox(f"{country} ({stat[country]})")
             checkbox.setChecked(True)
+            checkbox.stateChanged.connect(self.save_country_selection)
             self.country_checkboxes[country] = checkbox
             row = idx // cols
             col = idx % cols
             self.country_layout.addWidget(checkbox, row, col)
+
+        self.restore_country_selection()
+        self.filter_country_checkboxes()
 
         self.append_log("已按国家分组：")
         for country in countries:
@@ -884,10 +1110,12 @@ class MainWindow(QWidget):
     def select_all_countries(self):
         for cb in self.country_checkboxes.values():
             cb.setChecked(True)
+        self.save_country_selection()
 
     def unselect_all_countries(self):
         for cb in self.country_checkboxes.values():
             cb.setChecked(False)
+        self.save_country_selection()
 
     def start_latency_test(self):
         if not self.all_targets:
@@ -994,6 +1222,31 @@ class MainWindow(QWidget):
 
         return export_items, None
 
+    def test_webdav_connection(self):
+        base_url = normalize_webdav_url(self.webdav_url_edit.text())
+        username = self.webdav_user_edit.text().strip()
+        password = self.webdav_pass_edit.text()
+
+        self.webdav_url_edit.setText(base_url)
+
+        if not base_url:
+            QMessageBox.warning(self, "提示", "请输入WebDAV地址。")
+            return
+        if not username:
+            QMessageBox.warning(self, "提示", "请输入WebDAV用户名。")
+            return
+
+        try:
+            ok, msg = test_webdav_propfind(base_url, username, password, verify_ssl=True)
+            self.append_log(msg)
+            if ok:
+                QMessageBox.information(self, "成功", f"WebDAV 测试成功：\n{base_url}")
+            else:
+                QMessageBox.warning(self, "失败", msg)
+        except Exception as e:
+            self.append_log(f"测试WebDAV失败：{e}")
+            QMessageBox.warning(self, "失败", f"测试WebDAV失败：\n{e}")
+
     def export_results_local(self):
         export_items, err = self.prepare_export_items()
         if err:
@@ -1023,11 +1276,13 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "提示", err)
             return
 
-        base_url = self.webdav_url_edit.text().strip()
+        base_url = normalize_webdav_url(self.webdav_url_edit.text())
         username = self.webdav_user_edit.text().strip()
         password = self.webdav_pass_edit.text()
         remote_dir = self.webdav_dir_edit.text().strip()
         filename = ensure_txt_filename(self.export_name_edit.text())
+
+        self.webdav_url_edit.setText(base_url)
 
         if not base_url:
             QMessageBox.warning(self, "提示", "请输入WebDAV地址。")
@@ -1037,25 +1292,40 @@ class MainWindow(QWidget):
             return
 
         try:
+            ok, msg = test_webdav_propfind(base_url, username, password, verify_ssl=True)
+            self.append_log(msg)
+            if not ok:
+                QMessageBox.warning(self, "失败", f"WebDAV连接测试失败：\n{msg}")
+                return
+
             content = build_export_text(export_items).encode("utf-8")
-            status, full_url = upload_to_webdav(
+            result = upload_to_webdav(
                 base_url=base_url,
                 remote_dir=remote_dir,
                 filename=filename,
                 content=content,
                 username=username,
-                password=password
+                password=password,
+                verify_ssl=True
             )
-            self.append_log(f"已导出 {len(export_items)} 条结果到WebDAV：{full_url} (HTTP {status})")
-            QMessageBox.information(self, "完成", f"已成功上传到 WebDAV：\n{full_url}")
+            self.append_log(f"已导出 {len(export_items)} 条结果到WebDAV：{result['url']} (HTTP {result['status']})")
+            if result["body"]:
+                self.append_log(f"服务器响应：{result['body']}")
+            QMessageBox.information(self, "完成", f"已成功上传到 WebDAV：\n{result['url']}")
         except Exception as e:
             self.append_log(f"导出到WebDAV失败：{e}")
             QMessageBox.warning(self, "失败", f"导出到WebDAV失败：\n{e}")
+
+    def closeEvent(self, event):
+        self.save_settings()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setOrganizationName("mrbad423")
+    app.setApplicationName("advanced_country_speed_gui")
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
