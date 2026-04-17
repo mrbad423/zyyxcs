@@ -8,6 +8,7 @@ import threading
 import re
 import base64
 import json
+import statistics
 from urllib.parse import urlparse, quote
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,7 +19,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QTextEdit, QFileDialog,
     QVBoxLayout, QHBoxLayout, QLineEdit, QMessageBox, QSpinBox, QCheckBox,
-    QScrollArea, QGridLayout, QProgressBar, QGroupBox
+    QScrollArea, QGridLayout, QProgressBar, QGroupBox, QComboBox, QDoubleSpinBox
 )
 
 
@@ -205,7 +206,9 @@ def tcp_ping(ip: str, port: int, timeout=1.5):
         return None
 
 
-def download_speed_test(ip: str, port: int, stop_event: threading.Event):
+def timed_download_speed_test(ip: str, port: int, stop_event: threading.Event,
+                              duration_sec=2.0, slow_abort_threshold_mb=0.2,
+                              warmup_ratio=0.15):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -218,7 +221,14 @@ def download_speed_test(ip: str, port: int, stop_event: threading.Event):
         "Connection: close\r\n\r\n"
     ).encode()
 
-    speed = 0.0
+    result = {
+        "speed": 0.0,
+        "bytes": 0,
+        "duration": 0.0,
+        "aborted_early": False,
+        "success": False,
+    }
+
     try:
         if ":" in ip:
             addrinfo = socket.getaddrinfo(ip, port, socket.AF_INET6, socket.SOCK_STREAM)
@@ -230,39 +240,70 @@ def download_speed_test(ip: str, port: int, stop_event: threading.Event):
             sock = socket.create_connection((ip, port), timeout=3)
 
         ss = ctx.wrap_socket(sock, server_hostname=TEST_HOST)
-        ss.settimeout(3)
+        ss.settimeout(1.0)
         ss.sendall(req)
 
         start = time.time()
+        warmup_sec = max(0.0, duration_sec * warmup_ratio)
+        measure_start = start + warmup_sec
+
         header_data = b""
         header_done = False
         body_size = 0
+        measured_body_size = 0
 
-        while time.time() - start < 3:
+        while time.time() - start < duration_sec:
             if stop_event.is_set():
                 break
             try:
-                buf = ss.recv(8192)
+                buf = ss.recv(16384)
+                now = time.time()
                 if not buf:
                     break
+
                 if not header_done:
                     header_data += buf
                     if b"\r\n\r\n" in header_data:
                         header_done = True
                         body = header_data.split(b"\r\n\r\n", 1)[1]
                         body_size += len(body)
+                        if now >= measure_start:
+                            measured_body_size += len(body)
                 else:
                     body_size += len(buf)
+                    if now >= measure_start:
+                        measured_body_size += len(buf)
+
+                elapsed = now - start
+                effective_elapsed = max(now - measure_start, 0.001)
+
+                if elapsed >= min(1.0, duration_sec):
+                    current_speed = (measured_body_size / 1024 / 1024) / effective_elapsed
+                    if current_speed < slow_abort_threshold_mb:
+                        result["aborted_early"] = True
+                        break
+
             except socket.timeout:
-                break
+                continue
 
-        ss.close()
-        duration = time.time() - start
-        speed = round((body_size / 1024 / 1024) / max(duration, 0.1), 2)
+        end = time.time()
+        try:
+            ss.close()
+        except Exception:
+            pass
+
+        measured_duration = max(end - measure_start, 0.001)
+        speed = round((measured_body_size / 1024 / 1024) / measured_duration, 2)
+
+        result["speed"] = speed
+        result["bytes"] = measured_body_size
+        result["duration"] = measured_duration
+        result["success"] = measured_body_size > 0
+
     except Exception:
-        speed = 0.0
+        pass
 
-    return speed
+    return result
 
 
 def fetch_text_from_url(url: str):
@@ -330,20 +371,27 @@ def build_webdav_url(base_url: str, remote_dir: str, filename: str = None):
     return base_url
 
 
+def make_basic_auth(username: str, password: str):
+    return base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
+
+
+def open_request(req: Request, timeout=30, verify_ssl=True):
+    context = None
+    if not verify_ssl:
+        context = ssl._create_unverified_context()
+    return urlopen(req, timeout=timeout, context=context)
+
+
 def test_webdav_propfind(base_url: str, username: str, password: str, verify_ssl: bool = True):
-    auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
+    auth = make_basic_auth(username, password)
 
     req = Request(base_url.rstrip("/"), method="PROPFIND")
     req.add_header("Authorization", f"Basic {auth}")
     req.add_header("Depth", "0")
     req.add_header("User-Agent", "Mozilla/5.0")
 
-    context = None
-    if not verify_ssl:
-        context = ssl._create_unverified_context()
-
     try:
-        with urlopen(req, timeout=20, context=context) as resp:
+        with open_request(req, timeout=20, verify_ssl=verify_ssl) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
             return True, f"PROPFIND成功: HTTP {resp.status}\n{body}"
     except HTTPError as e:
@@ -357,10 +405,113 @@ def test_webdav_propfind(base_url: str, username: str, password: str, verify_ssl
         return False, f"连接失败: {e}"
 
 
+def webdav_path_exists(url: str, username: str, password: str, verify_ssl=True):
+    auth = make_basic_auth(username, password)
+    req = Request(url.rstrip("/"), method="PROPFIND")
+    req.add_header("Authorization", f"Basic {auth}")
+    req.add_header("Depth", "0")
+    req.add_header("User-Agent", "Mozilla/5.0")
+    try:
+        with open_request(req, timeout=20, verify_ssl=verify_ssl) as resp:
+            return True, resp.status, ""
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        if e.code == 404:
+            return False, e.code, body
+        return True, e.code, body
+    except Exception as e:
+        return False, None, str(e)
+
+
+def webdav_mkcol(url: str, username: str, password: str, verify_ssl=True):
+    auth = make_basic_auth(username, password)
+    req = Request(url.rstrip("/"), data=b"", method="MKCOL")
+    req.add_header("Authorization", f"Basic {auth}")
+    req.add_header("User-Agent", "Mozilla/5.0")
+    req.add_header("Connection", "close")
+    req.add_header("Content-Length", "0")
+
+    try:
+        with open_request(req, timeout=20, verify_ssl=verify_ssl) as resp:
+            return True, resp.status, ""
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        if e.code in (200, 201, 204, 301, 302, 307, 308, 405):
+            return True, e.code, body
+        return False, e.code, body
+    except Exception as e:
+        return False, None, str(e)
+
+
+def ensure_webdav_remote_dir(base_url: str, remote_dir: str, username: str, password: str,
+                             verify_ssl=True, logger=None):
+    remote_dir = (remote_dir or "").strip().strip("/")
+    if not remote_dir:
+        if logger:
+            logger("未设置远程目录，跳过MKCOL。")
+        return
+
+    parts = [p for p in remote_dir.split("/") if p.strip()]
+    current_parts = []
+
+    for part in parts:
+        current_parts.append(part)
+        current_dir = "/".join(current_parts)
+        current_url = build_webdav_url(base_url, current_dir)
+
+        if logger:
+            logger(f"检查远程目录：{current_url}")
+
+        exists, status, detail = webdav_path_exists(
+            current_url, username, password, verify_ssl=verify_ssl
+        )
+        if exists:
+            if logger:
+                logger(f"远程目录已存在：{current_url} (HTTP {status})")
+            continue
+
+        if logger:
+            logger(f"开始创建远程目录：{current_url}")
+
+        ok, mk_status, mk_detail = webdav_mkcol(
+            current_url, username, password, verify_ssl=verify_ssl
+        )
+        if ok:
+            if logger:
+                logger(f"远程目录创建成功：{current_url} (HTTP {mk_status})")
+            continue
+
+        raise Exception(
+            f"创建WebDAV目录失败\n"
+            f"目录URL: {current_url}\n"
+            f"HTTP状态码: {mk_status}\n"
+            f"响应内容:\n{mk_detail}"
+        )
+
+
 def upload_to_webdav(base_url: str, remote_dir: str, filename: str, content: bytes,
-                     username: str, password: str, verify_ssl: bool = True):
+                     username: str, password: str, verify_ssl: bool = True,
+                     auto_create_dir: bool = True, logger=None):
+    if auto_create_dir:
+        ensure_webdav_remote_dir(
+            base_url=base_url,
+            remote_dir=remote_dir,
+            username=username,
+            password=password,
+            verify_ssl=verify_ssl,
+            logger=logger
+        )
+
     full_url = build_webdav_url(base_url, remote_dir, filename)
-    auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
+    auth = make_basic_auth(username, password)
 
     req = Request(full_url, data=content, method="PUT")
     req.add_header("Authorization", f"Basic {auth}")
@@ -369,12 +520,8 @@ def upload_to_webdav(base_url: str, remote_dir: str, filename: str, content: byt
     req.add_header("User-Agent", "Mozilla/5.0")
     req.add_header("Connection", "close")
 
-    context = None
-    if not verify_ssl:
-        context = ssl._create_unverified_context()
-
     try:
-        with urlopen(req, timeout=30, context=context) as resp:
+        with open_request(req, timeout=30, verify_ssl=verify_ssl) as resp:
             body = ""
             try:
                 body = resp.read().decode("utf-8", errors="ignore")
@@ -411,6 +558,13 @@ def upload_to_webdav(base_url: str, remote_dir: str, filename: str, content: byt
         raise Exception(f"WebDAV连接失败\nURL: {full_url}\n错误: {e}")
 
 
+def calc_score(item, speed_weight=0.7, latency_weight=0.3):
+    speed = float(item.get("download_speed", 0.0) or 0.0)
+    latency = float(item.get("latency", 999999.0) or 999999.0)
+    latency_score = 1000.0 / max(latency + 1.0, 1.0)
+    return speed * speed_weight + latency_score * latency_weight
+
+
 class LoadUrlWorker(QThread):
     log = pyqtSignal(str)
     finished_signal = pyqtSignal(bool, str)
@@ -433,7 +587,7 @@ class LatencyTestWorker(QThread):
     progress = pyqtSignal(int, int)
     finished_signal = pyqtSignal(list)
 
-    def __init__(self, targets, threads=20):
+    def __init__(self, targets, threads=80):
         super().__init__()
         self.targets = targets
         self.threads = threads
@@ -459,6 +613,7 @@ class LatencyTestWorker(QThread):
             result = dict(item)
             result["latency"] = latency
             result["download_speed"] = 0.0
+            result["score"] = 0.0
             return result
 
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
@@ -499,14 +654,30 @@ class SpeedTestWorker(QThread):
     progress = pyqtSignal(int, int)
     finished_signal = pyqtSignal(list)
 
-    def __init__(self, targets, threads=20):
+    def __init__(self, targets, threads=10, repeats=2, duration_sec=2.0,
+                 slow_abort_threshold=0.2, agg_mode="median",
+                 speed_weight=0.7, latency_weight=0.3):
         super().__init__()
         self.targets = targets
         self.threads = threads
+        self.repeats = repeats
+        self.duration_sec = duration_sec
+        self.slow_abort_threshold = slow_abort_threshold
+        self.agg_mode = agg_mode
+        self.speed_weight = speed_weight
+        self.latency_weight = latency_weight
         self.stop_event = threading.Event()
 
     def stop(self):
         self.stop_event.set()
+
+    def aggregate_speed(self, samples):
+        valid = [x for x in samples if x >= 0]
+        if not valid:
+            return 0.0
+        if self.agg_mode == "mean":
+            return round(sum(valid) / len(valid), 2)
+        return round(statistics.median(valid), 2)
 
     def run(self):
         if not self.targets:
@@ -514,14 +685,46 @@ class SpeedTestWorker(QThread):
             self.finished_signal.emit([])
             return
 
-        self.log.emit(f"开始对 {len(self.targets)} 个有延迟节点进行测速...")
+        self.log.emit(
+            f"开始对 {len(self.targets)} 个节点进行测速..."
+            f" | 并发={self.threads}"
+            f" | 次数={self.repeats}"
+            f" | 时长={self.duration_sec}s"
+            f" | 聚合={self.agg_mode}"
+        )
+
         results = []
         completed = 0
 
         def speed_one(item):
             result = dict(item)
-            speed = download_speed_test(item["ip"], item["port"], self.stop_event)
-            result["download_speed"] = speed
+            samples = []
+            early_abort_count = 0
+
+            for i in range(self.repeats):
+                if self.stop_event.is_set():
+                    break
+                test_result = timed_download_speed_test(
+                    item["ip"],
+                    item["port"],
+                    self.stop_event,
+                    duration_sec=self.duration_sec,
+                    slow_abort_threshold_mb=self.slow_abort_threshold
+                )
+                speed = float(test_result["speed"])
+                samples.append(speed)
+                if test_result["aborted_early"]:
+                    early_abort_count += 1
+
+                if self.repeats >= 2 and i == 0 and speed < self.slow_abort_threshold:
+                    break
+
+            result["speed_samples"] = samples
+            result["download_speed"] = self.aggregate_speed(samples)
+            result["score"] = round(
+                calc_score(result, self.speed_weight, self.latency_weight), 4
+            )
+            result["early_abort_count"] = early_abort_count
             return result
 
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
@@ -542,24 +745,27 @@ class SpeedTestWorker(QThread):
                         f"{format_ip_port(result['ip'], result['port'])} | "
                         f"{result['country']} | "
                         f"{result['latency']:.2f} ms | "
-                        f"{result['download_speed']:.2f} MB/s"
+                        f"{result['download_speed']:.2f} MB/s | "
+                        f"样本={result.get('speed_samples', [])} | "
+                        f"评分={result['score']:.4f}"
                     )
                 except Exception as e:
                     self.log.emit(f"[{completed}/{len(self.targets)}] 测速异常: {e}")
 
-        results.sort(key=lambda x: x["download_speed"], reverse=True)
+        results.sort(key=lambda x: (x.get("score", 0.0), x.get("download_speed", 0.0)), reverse=True)
         self.finished_signal.emit(results)
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("国家分组测速工具 - WebDAV增强版")
-        self.resize(1280, 860)
+        self.setWindowTitle("国家分组测速工具 - 效率稳定增强版")
+        self.resize(1350, 920)
 
         self.all_targets = []
         self.country_checkboxes = {}
         self.latency_results = []
+        self.speed_candidates = []
         self.results = []
         self.worker = None
         self.url_loader = None
@@ -579,7 +785,7 @@ class MainWindow(QWidget):
         main_layout.setSpacing(12)
         main_layout.setContentsMargins(14, 14, 14, 14)
 
-        title = QLabel("国家分组测速工具 - WebDAV增强版")
+        title = QLabel("国家分组测速工具 - 效率稳定增强版")
         title.setObjectName("titleLabel")
         title.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(title)
@@ -612,10 +818,26 @@ class MainWindow(QWidget):
         self.port_input.setRange(1, 65535)
         self.port_input.setValue(443)
 
-        self.thread_input = QSpinBox()
-        self.thread_input.setRange(1, 500)
-        self.thread_input.setValue(20)
+        self.latency_thread_input = QSpinBox()
+        self.latency_thread_input.setRange(1, 500)
+        self.latency_thread_input.setValue(80)
 
+        self.speed_thread_input = QSpinBox()
+        self.speed_thread_input.setRange(1, 200)
+        self.speed_thread_input.setValue(10)
+
+        row3.addWidget(QLabel("默认端口:"))
+        row3.addWidget(self.port_input)
+        row3.addSpacing(12)
+        row3.addWidget(QLabel("延迟线程:"))
+        row3.addWidget(self.latency_thread_input)
+        row3.addSpacing(12)
+        row3.addWidget(QLabel("测速线程:"))
+        row3.addWidget(self.speed_thread_input)
+        row3.addStretch()
+        import_layout.addLayout(row3)
+
+        row4 = QHBoxLayout()
         self.country_input = QLineEdit()
         self.country_input.setPlaceholderText("导出筛选国家，留空=全部，例如：HK,JP,SG")
 
@@ -624,21 +846,85 @@ class MainWindow(QWidget):
         self.topn_input.setValue(10)
         self.topn_input.setToolTip("每国导出前N条，0表示全部")
 
-        row3.addWidget(QLabel("默认端口:"))
-        row3.addWidget(self.port_input)
-        row3.addSpacing(12)
-        row3.addWidget(QLabel("线程数:"))
-        row3.addWidget(self.thread_input)
-        row3.addSpacing(12)
-        row3.addWidget(QLabel("导出筛选国家:"))
-        row3.addWidget(self.country_input)
-        row3.addSpacing(12)
-        row3.addWidget(QLabel("每国前N条:"))
-        row3.addWidget(self.topn_input)
+        self.speed_topn_input = QSpinBox()
+        self.speed_topn_input.setRange(1, 100000)
+        self.speed_topn_input.setValue(50)
+        self.speed_topn_input.setToolTip("延迟测试后，仅取前N个节点进入测速")
 
-        import_layout.addLayout(row3)
+        row4.addWidget(QLabel("导出筛选国家:"))
+        row4.addWidget(self.country_input)
+        row4.addSpacing(12)
+        row4.addWidget(QLabel("每国前N条:"))
+        row4.addWidget(self.topn_input)
+        row4.addSpacing(12)
+        row4.addWidget(QLabel("进入测速前N个:"))
+        row4.addWidget(self.speed_topn_input)
+
+        import_layout.addLayout(row4)
         import_group.setLayout(import_layout)
         main_layout.addWidget(import_group)
+
+        strategy_group = QGroupBox("测速策略")
+        strategy_layout = QVBoxLayout()
+
+        strategy_row1 = QHBoxLayout()
+
+        self.speed_repeat_input = QSpinBox()
+        self.speed_repeat_input.setRange(1, 10)
+        self.speed_repeat_input.setValue(2)
+
+        self.speed_duration_input = QDoubleSpinBox()
+        self.speed_duration_input.setRange(0.5, 30.0)
+        self.speed_duration_input.setSingleStep(0.5)
+        self.speed_duration_input.setValue(2.0)
+
+        self.slow_abort_input = QDoubleSpinBox()
+        self.slow_abort_input.setRange(0.0, 1000.0)
+        self.slow_abort_input.setSingleStep(0.1)
+        self.slow_abort_input.setValue(0.2)
+        self.slow_abort_input.setSuffix(" MB/s")
+
+        self.agg_mode_combo = QComboBox()
+        self.agg_mode_combo.addItem("中位数", "median")
+        self.agg_mode_combo.addItem("平均值", "mean")
+
+        strategy_row1.addWidget(QLabel("每节点测速次数:"))
+        strategy_row1.addWidget(self.speed_repeat_input)
+        strategy_row1.addSpacing(12)
+        strategy_row1.addWidget(QLabel("单次测速时长:"))
+        strategy_row1.addWidget(self.speed_duration_input)
+        strategy_row1.addSpacing(12)
+        strategy_row1.addWidget(QLabel("低速提前终止阈值:"))
+        strategy_row1.addWidget(self.slow_abort_input)
+        strategy_row1.addSpacing(12)
+        strategy_row1.addWidget(QLabel("测速聚合方式:"))
+        strategy_row1.addWidget(self.agg_mode_combo)
+        strategy_row1.addStretch()
+
+        strategy_layout.addLayout(strategy_row1)
+
+        strategy_row2 = QHBoxLayout()
+
+        self.speed_weight_input = QDoubleSpinBox()
+        self.speed_weight_input.setRange(0.0, 1.0)
+        self.speed_weight_input.setSingleStep(0.1)
+        self.speed_weight_input.setValue(0.7)
+
+        self.latency_weight_input = QDoubleSpinBox()
+        self.latency_weight_input.setRange(0.0, 1.0)
+        self.latency_weight_input.setSingleStep(0.1)
+        self.latency_weight_input.setValue(0.3)
+
+        strategy_row2.addWidget(QLabel("速度权重:"))
+        strategy_row2.addWidget(self.speed_weight_input)
+        strategy_row2.addSpacing(12)
+        strategy_row2.addWidget(QLabel("延迟权重:"))
+        strategy_row2.addWidget(self.latency_weight_input)
+        strategy_row2.addStretch()
+
+        strategy_layout.addLayout(strategy_row2)
+        strategy_group.setLayout(strategy_layout)
+        main_layout.addWidget(strategy_group)
 
         country_group = QGroupBox("国家选择")
         country_main_layout = QVBoxLayout()
@@ -801,7 +1087,7 @@ class MainWindow(QWidget):
                 color: #7cc7ff;
                 padding: 8px;
             }
-            QLineEdit, QSpinBox, QTextEdit {
+            QLineEdit, QSpinBox, QTextEdit, QComboBox, QDoubleSpinBox {
                 background-color: #2b2d3a;
                 border: 1px solid #44485a;
                 border-radius: 8px;
@@ -857,9 +1143,18 @@ class MainWindow(QWidget):
         self.webdav_user_edit.textChanged.connect(self.save_settings)
         self.webdav_pass_edit.textChanged.connect(self.save_settings)
         self.webdav_dir_edit.textChanged.connect(self.save_settings)
+
         self.port_input.valueChanged.connect(self.save_settings)
-        self.thread_input.valueChanged.connect(self.save_settings)
+        self.latency_thread_input.valueChanged.connect(self.save_settings)
+        self.speed_thread_input.valueChanged.connect(self.save_settings)
         self.topn_input.valueChanged.connect(self.save_settings)
+        self.speed_topn_input.valueChanged.connect(self.save_settings)
+        self.speed_repeat_input.valueChanged.connect(self.save_settings)
+        self.speed_duration_input.valueChanged.connect(self.save_settings)
+        self.slow_abort_input.valueChanged.connect(self.save_settings)
+        self.agg_mode_combo.currentIndexChanged.connect(self.save_settings)
+        self.speed_weight_input.valueChanged.connect(self.save_settings)
+        self.latency_weight_input.valueChanged.connect(self.save_settings)
 
     def load_settings(self):
         self._loading_settings = True
@@ -871,11 +1166,27 @@ class MainWindow(QWidget):
             self.file_edit.setText(self.settings.value("import/file_path", ""))
             self.url_edit.setText(self.settings.value("import/url", ""))
             self.port_input.setValue(self.settings.value("import/default_port", 443, type=int))
-            self.thread_input.setValue(self.settings.value("test/threads", 20, type=int))
+            self.latency_thread_input.setValue(self.settings.value("test/latency_threads", 80, type=int))
+            self.speed_thread_input.setValue(self.settings.value("test/speed_threads", 10, type=int))
+
             self.country_input.setText(self.settings.value("export/countries", ""))
             self.topn_input.setValue(self.settings.value("export/topn_each", 10, type=int))
             self.country_search_edit.setText(self.settings.value("country/search", ""))
             self.export_name_edit.setText(self.settings.value("export/filename", "export_result.txt"))
+
+            self.speed_topn_input.setValue(self.settings.value("test/speed_topn", 50, type=int))
+            self.speed_repeat_input.setValue(self.settings.value("test/speed_repeats", 2, type=int))
+            self.speed_duration_input.setValue(self.settings.value("test/speed_duration", 2.0, type=float))
+            self.slow_abort_input.setValue(self.settings.value("test/slow_abort_threshold", 0.2, type=float))
+
+            agg_value = self.settings.value("test/agg_mode", "median")
+            idx = self.agg_mode_combo.findData(agg_value)
+            if idx >= 0:
+                self.agg_mode_combo.setCurrentIndex(idx)
+
+            self.speed_weight_input.setValue(self.settings.value("test/speed_weight", 0.7, type=float))
+            self.latency_weight_input.setValue(self.settings.value("test/latency_weight", 0.3, type=float))
+
             self.webdav_url_edit.setText(self.settings.value("webdav/url", ""))
             self.webdav_user_edit.setText(self.settings.value("webdav/username", ""))
             self.webdav_pass_edit.setText(self.settings.value("webdav/password", ""))
@@ -915,11 +1226,22 @@ class MainWindow(QWidget):
         self.settings.setValue("import/file_path", self.file_edit.text().strip())
         self.settings.setValue("import/url", self.url_edit.text().strip())
         self.settings.setValue("import/default_port", self.port_input.value())
-        self.settings.setValue("test/threads", self.thread_input.value())
+        self.settings.setValue("test/latency_threads", self.latency_thread_input.value())
+        self.settings.setValue("test/speed_threads", self.speed_thread_input.value())
+
         self.settings.setValue("export/countries", self.country_input.text().strip())
         self.settings.setValue("export/topn_each", self.topn_input.value())
         self.settings.setValue("country/search", self.country_search_edit.text().strip())
         self.settings.setValue("export/filename", self.export_name_edit.text().strip())
+
+        self.settings.setValue("test/speed_topn", self.speed_topn_input.value())
+        self.settings.setValue("test/speed_repeats", self.speed_repeat_input.value())
+        self.settings.setValue("test/speed_duration", self.speed_duration_input.value())
+        self.settings.setValue("test/slow_abort_threshold", self.slow_abort_input.value())
+        self.settings.setValue("test/agg_mode", self.agg_mode_combo.currentData())
+        self.settings.setValue("test/speed_weight", self.speed_weight_input.value())
+        self.settings.setValue("test/latency_weight", self.latency_weight_input.value())
+
         self.settings.setValue("webdav/url", self.webdav_url_edit.text().strip())
         self.settings.setValue("webdav/username", self.webdav_user_edit.text().strip())
         self.settings.setValue("webdav/password", self.webdav_pass_edit.text())
@@ -1128,11 +1450,12 @@ class MainWindow(QWidget):
             return
 
         self.latency_results = []
+        self.speed_candidates = []
         self.results = []
         self.log_edit.clear()
         self.reset_progress()
 
-        threads = self.thread_input.value()
+        threads = self.latency_thread_input.value()
         self.worker = LatencyTestWorker(selected_targets, threads)
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.update_progress)
@@ -1148,21 +1471,51 @@ class MainWindow(QWidget):
 
     def on_latency_finished(self, results):
         self.latency_results = results
+        topn = self.speed_topn_input.value()
+        self.speed_candidates = results[:topn]
+
         self.btn_latency.setEnabled(True)
-        self.btn_speed.setEnabled(True if results else False)
+        self.btn_speed.setEnabled(True if self.speed_candidates else False)
         self.set_status("延迟测试完成")
+
         self.append_log(f"延迟测试完成，保留 {len(results)} 个有延迟节点。")
+        self.append_log(f"进入测速候选节点数：{len(self.speed_candidates)} / {len(results)}（取前 {topn} 个最低延迟）")
 
     def start_speed_test(self):
-        if not self.latency_results:
-            QMessageBox.warning(self, "提示", "请先进行延迟测试，且必须有可用节点。")
+        if not self.speed_candidates:
+            QMessageBox.warning(self, "提示", "请先进行延迟测试，且必须有可测速候选节点。")
             return
+
+        speed_weight = self.speed_weight_input.value()
+        latency_weight = self.latency_weight_input.value()
+        total_weight = speed_weight + latency_weight
+
+        if total_weight <= 0:
+            QMessageBox.warning(self, "提示", "速度权重和延迟权重之和必须大于 0。")
+            return
+
+        speed_weight = speed_weight / total_weight
+        latency_weight = latency_weight / total_weight
 
         self.results = []
         self.reset_progress()
 
-        threads = self.thread_input.value()
-        self.worker = SpeedTestWorker(self.latency_results, threads)
+        threads = self.speed_thread_input.value()
+        repeats = self.speed_repeat_input.value()
+        duration_sec = self.speed_duration_input.value()
+        slow_abort_threshold = self.slow_abort_input.value()
+        agg_mode = self.agg_mode_combo.currentData()
+
+        self.worker = SpeedTestWorker(
+            self.speed_candidates,
+            threads=threads,
+            repeats=repeats,
+            duration_sec=duration_sec,
+            slow_abort_threshold=slow_abort_threshold,
+            agg_mode=agg_mode,
+            speed_weight=speed_weight,
+            latency_weight=latency_weight
+        )
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished_signal.connect(self.on_speed_finished)
@@ -1171,14 +1524,17 @@ class MainWindow(QWidget):
         self.btn_latency.setEnabled(False)
         self.btn_speed.setEnabled(False)
         self.set_status("测速中")
-        self.append_log("开始测速（仅针对有延迟节点）...")
+        self.append_log(
+            f"开始测速：候选节点={len(self.speed_candidates)} | "
+            f"测速线程={threads} | 次数={repeats} | 时长={duration_sec}s | 聚合={agg_mode}"
+        )
 
     def on_speed_finished(self, results):
         self.results = results
         self.btn_latency.setEnabled(True)
         self.btn_speed.setEnabled(True)
         self.set_status("测速完成")
-        self.append_log(f"测速完成，共得到 {len(results)} 条结果。")
+        self.append_log(f"测速完成，共得到 {len(results)} 条结果。当前按综合评分排序。")
 
     def stop_test(self):
         if self.worker:
@@ -1188,6 +1544,7 @@ class MainWindow(QWidget):
 
     def clear_results(self):
         self.latency_results = []
+        self.speed_candidates = []
         self.results = []
         self.log_edit.clear()
         self.reset_progress()
@@ -1212,7 +1569,11 @@ class MainWindow(QWidget):
         target_countries = countries if countries else sorted(grouped.keys())
         for country in target_countries:
             items = grouped.get(country, [])
-            items.sort(key=lambda x: x.get("download_speed", 0), reverse=True)
+            if self.results:
+                items.sort(key=lambda x: (x.get("score", 0.0), x.get("download_speed", 0.0)), reverse=True)
+            else:
+                items.sort(key=lambda x: x.get("latency", 999999.0))
+
             if topn_each > 0:
                 items = items[:topn_each]
             export_items.extend(items)
@@ -1306,7 +1667,9 @@ class MainWindow(QWidget):
                 content=content,
                 username=username,
                 password=password,
-                verify_ssl=True
+                verify_ssl=True,
+                auto_create_dir=True,
+                logger=self.append_log
             )
             self.append_log(f"已导出 {len(export_items)} 条结果到WebDAV：{result['url']} (HTTP {result['status']})")
             if result["body"]:
