@@ -6,7 +6,8 @@ import ssl
 import ipaddress
 import threading
 import re
-from urllib.parse import urlparse
+import base64
+from urllib.parse import urlparse, quote
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -15,28 +16,13 @@ from urllib.request import Request, urlopen
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QTextEdit, QFileDialog,
-    QVBoxLayout, QHBoxLayout, QLineEdit, QMessageBox, QSpinBox, QTableWidget,
-    QTableWidgetItem, QHeaderView, QCheckBox, QScrollArea, QGridLayout,
-    QProgressBar, QGroupBox, QAbstractItemView
+    QVBoxLayout, QHBoxLayout, QLineEdit, QMessageBox, QSpinBox, QCheckBox,
+    QScrollArea, QGridLayout, QProgressBar, QGroupBox
 )
 
 
 TEST_HOST = "speed.cloudflare.com"
 DOWNLOAD_PATH = "/__down?bytes=50000000"
-
-
-class NumericTableWidgetItem(QTableWidgetItem):
-    def __init__(self, value, text=None):
-        super().__init__(text if text is not None else str(value))
-        self.numeric_value = value
-
-    def __lt__(self, other):
-        if isinstance(other, NumericTableWidgetItem):
-            return self.numeric_value < other.numeric_value
-        try:
-            return float(self.text()) < float(other.text())
-        except Exception:
-            return super().__lt__(other)
 
 
 def format_ip_port(ip: str, port: int) -> str:
@@ -223,7 +209,7 @@ def tcp_ping(ip: str, port: int, timeout=1.5):
         return None
 
 
-def download_speed_test(ip: str, port: int, country: str, latency: float, stop_event: threading.Event):
+def download_speed_test(ip: str, port: int, stop_event: threading.Event):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -303,6 +289,47 @@ def fetch_text_from_url(url: str):
             return data.decode("utf-8", errors="ignore")
 
 
+def ensure_txt_filename(name: str):
+    name = name.strip()
+    if not name:
+        name = "export_result"
+    if not name.lower().endswith(".txt"):
+        name += ".txt"
+    return name
+
+
+def build_export_text(items):
+    lines = []
+    for item in items:
+        raw_line = item.get("raw_line", "").strip()
+        if raw_line:
+            lines.append(raw_line)
+        else:
+            ip_port = format_ip_port(item["ip"], item["port"])
+            lines.append(f"{ip_port}#{item.get('country', 'UNKNOWN')}")
+    return "\n".join(lines) + "\n"
+
+
+def upload_to_webdav(base_url: str, remote_dir: str, filename: str, content: bytes, username: str, password: str):
+    base_url = base_url.strip().rstrip("/")
+    remote_dir = remote_dir.strip().strip("/")
+    filename_encoded = quote(filename)
+
+    if remote_dir:
+        full_url = f"{base_url}/{remote_dir}/{filename_encoded}"
+    else:
+        full_url = f"{base_url}/{filename_encoded}"
+
+    req = Request(full_url, data=content, method="PUT")
+    auth = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("utf-8")
+    req.add_header("Authorization", f"Basic {auth}")
+    req.add_header("Content-Type", "text/plain; charset=utf-8")
+    req.add_header("Content-Length", str(len(content)))
+
+    with urlopen(req, timeout=30) as resp:
+        return resp.status, full_url
+
+
 class LoadUrlWorker(QThread):
     log = pyqtSignal(str)
     finished_signal = pyqtSignal(bool, str)
@@ -323,7 +350,6 @@ class LoadUrlWorker(QThread):
 class LatencyTestWorker(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int, int)
-    result_signal = pyqtSignal(dict)
     finished_signal = pyqtSignal(list)
 
     def __init__(self, targets, threads=20):
@@ -368,7 +394,6 @@ class LatencyTestWorker(QThread):
                     result = future.result()
                     if result is not None:
                         results.append(result)
-                        self.result_signal.emit(result)
                         self.log.emit(
                             f"[{completed}/{len(self.targets)}] "
                             f"{format_ip_port(result['ip'], result['port'])} | "
@@ -391,7 +416,6 @@ class LatencyTestWorker(QThread):
 class SpeedTestWorker(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int, int)
-    result_signal = pyqtSignal(dict)
     finished_signal = pyqtSignal(list)
 
     def __init__(self, targets, threads=20):
@@ -415,13 +439,7 @@ class SpeedTestWorker(QThread):
 
         def speed_one(item):
             result = dict(item)
-            speed = download_speed_test(
-                item["ip"],
-                item["port"],
-                item["country"],
-                item["latency"],
-                self.stop_event
-            )
+            speed = download_speed_test(item["ip"], item["port"], self.stop_event)
             result["download_speed"] = speed
             return result
 
@@ -438,7 +456,6 @@ class SpeedTestWorker(QThread):
                 try:
                     result = future.result()
                     results.append(result)
-                    self.result_signal.emit(result)
                     self.log.emit(
                         f"[{completed}/{len(self.targets)}] "
                         f"{format_ip_port(result['ip'], result['port'])} | "
@@ -456,8 +473,8 @@ class SpeedTestWorker(QThread):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("国家分组测速工具 - 高级增强版")
-        self.resize(1480, 980)
+        self.setWindowTitle("国家分组测速工具 - WebDAV增强版")
+        self.resize(1280, 860)
 
         self.all_targets = []
         self.country_checkboxes = {}
@@ -465,7 +482,6 @@ class MainWindow(QWidget):
         self.results = []
         self.worker = None
         self.url_loader = None
-        self.source_mode = "file"   # file or url
 
         self.init_ui()
         self.apply_styles()
@@ -475,12 +491,12 @@ class MainWindow(QWidget):
         main_layout.setSpacing(12)
         main_layout.setContentsMargins(14, 14, 14, 14)
 
-        title = QLabel("国家分组测速工具 - 高级增强版")
+        title = QLabel("国家分组测速工具 - WebDAV增强版")
         title.setObjectName("titleLabel")
         title.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(title)
 
-        # 导入区
+        # 导入设置
         import_group = QGroupBox("导入设置")
         import_layout = QVBoxLayout()
 
@@ -524,15 +540,12 @@ class MainWindow(QWidget):
         row3.addWidget(QLabel("默认端口:"))
         row3.addWidget(self.port_input)
         row3.addSpacing(12)
-
         row3.addWidget(QLabel("线程数:"))
         row3.addWidget(self.thread_input)
         row3.addSpacing(12)
-
         row3.addWidget(QLabel("导出筛选国家:"))
         row3.addWidget(self.country_input)
         row3.addSpacing(12)
-
         row3.addWidget(QLabel("每国前N条:"))
         row3.addWidget(self.topn_input)
 
@@ -540,7 +553,7 @@ class MainWindow(QWidget):
         import_group.setLayout(import_layout)
         main_layout.addWidget(import_group)
 
-        # 国家区
+        # 国家选择
         country_group = QGroupBox("国家选择")
         country_main_layout = QVBoxLayout()
 
@@ -574,7 +587,48 @@ class MainWindow(QWidget):
         country_group.setLayout(country_main_layout)
         main_layout.addWidget(country_group)
 
-        # 操作区
+        # 导出设置
+        export_group = QGroupBox("导出设置")
+        export_layout = QVBoxLayout()
+
+        export_row1 = QHBoxLayout()
+        self.export_name_edit = QLineEdit()
+        self.export_name_edit.setPlaceholderText("导出文件名，例如 result.txt")
+        self.export_name_edit.setText("export_result.txt")
+        export_row1.addWidget(QLabel("导出文件名:"))
+        export_row1.addWidget(self.export_name_edit)
+        export_layout.addLayout(export_row1)
+
+        export_row2 = QHBoxLayout()
+        self.webdav_url_edit = QLineEdit()
+        self.webdav_url_edit.setPlaceholderText("WebDAV地址，例如：https://dav.example.com/dav")
+        export_row2.addWidget(QLabel("WebDAV地址:"))
+        export_row2.addWidget(self.webdav_url_edit)
+        export_layout.addLayout(export_row2)
+
+        export_row3 = QHBoxLayout()
+        self.webdav_user_edit = QLineEdit()
+        self.webdav_user_edit.setPlaceholderText("WebDAV用户名")
+        self.webdav_pass_edit = QLineEdit()
+        self.webdav_pass_edit.setPlaceholderText("WebDAV密码")
+        self.webdav_pass_edit.setEchoMode(QLineEdit.Password)
+        export_row3.addWidget(QLabel("用户名:"))
+        export_row3.addWidget(self.webdav_user_edit)
+        export_row3.addWidget(QLabel("密码:"))
+        export_row3.addWidget(self.webdav_pass_edit)
+        export_layout.addLayout(export_row3)
+
+        export_row4 = QHBoxLayout()
+        self.webdav_dir_edit = QLineEdit()
+        self.webdav_dir_edit.setPlaceholderText("远程目录，例如：测速结果/2025/04")
+        export_row4.addWidget(QLabel("远程目录:"))
+        export_row4.addWidget(self.webdav_dir_edit)
+        export_layout.addLayout(export_row4)
+
+        export_group.setLayout(export_layout)
+        main_layout.addWidget(export_group)
+
+        # 操作
         action_group = QGroupBox("操作")
         action_layout = QVBoxLayout()
 
@@ -582,13 +636,15 @@ class MainWindow(QWidget):
         self.btn_latency = QPushButton("延迟测试")
         self.btn_speed = QPushButton("测速")
         self.btn_stop = QPushButton("停止")
-        self.btn_export = QPushButton("导出结果")
+        self.btn_export = QPushButton("导出到本地")
+        self.btn_export_webdav = QPushButton("导出到WebDAV")
         self.btn_clear = QPushButton("清空结果")
 
         self.btn_latency.clicked.connect(self.start_latency_test)
         self.btn_speed.clicked.connect(self.start_speed_test)
         self.btn_stop.clicked.connect(self.stop_test)
-        self.btn_export.clicked.connect(self.export_results)
+        self.btn_export.clicked.connect(self.export_results_local)
+        self.btn_export_webdav.clicked.connect(self.export_results_webdav)
         self.btn_clear.clicked.connect(self.clear_results)
 
         self.btn_speed.setEnabled(False)
@@ -597,6 +653,7 @@ class MainWindow(QWidget):
         row_action.addWidget(self.btn_speed)
         row_action.addWidget(self.btn_stop)
         row_action.addWidget(self.btn_export)
+        row_action.addWidget(self.btn_export_webdav)
         row_action.addWidget(self.btn_clear)
         row_action.addStretch()
         action_layout.addLayout(row_action)
@@ -614,31 +671,7 @@ class MainWindow(QWidget):
         action_group.setLayout(action_layout)
         main_layout.addWidget(action_group)
 
-        # 统计区
-        result_group = QGroupBox("结果与统计")
-        result_layout = QVBoxLayout()
-
-        result_layout.addWidget(QLabel("国家分组统计："))
-        self.country_table = QTableWidget(0, 4)
-        self.country_table.setHorizontalHeaderLabels(["国家", "数量", "平均延迟(ms)", "平均速度(MB/s)"])
-        self.country_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.country_table.setSortingEnabled(True)
-        self.country_table.setMinimumHeight(220)
-        result_layout.addWidget(self.country_table)
-
-        result_layout.addWidget(QLabel("节点明细（双击可复制原始行/地址）："))
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["原始内容", "IP", "端口", "国家", "延迟(ms)", "速度(MB/s)"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setSortingEnabled(True)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.cellDoubleClicked.connect(self.copy_row_content)
-        result_layout.addWidget(self.table)
-
-        result_group.setLayout(result_layout)
-        main_layout.addWidget(result_group)
-
-        # 日志区
+        # 日志
         log_group = QGroupBox("运行日志")
         log_layout = QVBoxLayout()
         self.log_edit = QTextEdit()
@@ -676,7 +709,7 @@ class MainWindow(QWidget):
                 color: #7cc7ff;
                 padding: 8px;
             }
-            QLineEdit, QSpinBox, QTextEdit, QTableWidget {
+            QLineEdit, QSpinBox, QTextEdit {
                 background-color: #2b2d3a;
                 border: 1px solid #44485a;
                 border-radius: 8px;
@@ -700,13 +733,6 @@ class MainWindow(QWidget):
             QPushButton:disabled {
                 background-color: #666a7a;
                 color: #cccccc;
-            }
-            QHeaderView::section {
-                background-color: #323546;
-                color: #ffffff;
-                padding: 6px;
-                border: 1px solid #44485a;
-                font-weight: bold;
             }
             QProgressBar {
                 border: 1px solid #44485a;
@@ -749,15 +775,11 @@ class MainWindow(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "选择TXT文件", "", "Text Files (*.txt);;All Files (*)")
         if not path:
             return
-
         self.file_edit.setText(path)
-        self.source_mode = "file"
         self.log_edit.clear()
-
         ok = self.load_targets_from_file(path)
         if ok:
             self.append_log(f"本地文件加载完成，共解析到 {len(self.all_targets)} 个目标。")
-            self.update_country_stats(self.all_targets)
             self.set_status("已加载本地TXT")
 
     def load_targets_from_file(self, path):
@@ -801,9 +823,7 @@ class MainWindow(QWidget):
             self.set_status("远程TXT加载失败")
             return
 
-        self.source_mode = "url"
         self.all_targets = []
-
         for line in content.splitlines():
             item = parse_ip_port_country_line(line, self.port_input.value())
             if item:
@@ -815,7 +835,6 @@ class MainWindow(QWidget):
             return
 
         self.build_country_checkboxes()
-        self.update_country_stats(self.all_targets)
         self.append_log(f"远程TXT加载完成，共解析到 {len(self.all_targets)} 个目标。")
         self.set_status("已加载远程TXT")
 
@@ -870,41 +889,6 @@ class MainWindow(QWidget):
         for cb in self.country_checkboxes.values():
             cb.setChecked(False)
 
-    def add_result_row(self, item):
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-
-        raw_line = item.get("raw_line", "")
-        self.table.setItem(row, 0, QTableWidgetItem(raw_line))
-        self.table.setItem(row, 1, QTableWidgetItem(item["ip"]))
-        self.table.setItem(row, 2, NumericTableWidgetItem(item["port"], str(item["port"])))
-        self.table.setItem(row, 3, QTableWidgetItem(item.get("country", "UNKNOWN")))
-        self.table.setItem(row, 4, NumericTableWidgetItem(item.get("latency", 0.0), f"{item.get('latency', 0.0):.2f}"))
-        self.table.setItem(row, 5, NumericTableWidgetItem(item.get("download_speed", 0.0), f"{item.get('download_speed', 0.0):.2f}"))
-
-    def update_country_stats(self, items):
-        grouped = defaultdict(list)
-        for item in items:
-            grouped[item.get("country", "UNKNOWN").upper()].append(item)
-
-        self.country_table.setRowCount(0)
-
-        for country in sorted(grouped.keys()):
-            group_items = grouped[country]
-            count = len(group_items)
-            latencies = [x.get("latency", 0) for x in group_items if x.get("latency", 0) > 0]
-            speeds = [x.get("download_speed", 0) for x in group_items if x.get("download_speed", 0) > 0]
-
-            avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else 0.0
-            avg_speed = round(sum(speeds) / len(speeds), 2) if speeds else 0.0
-
-            row = self.country_table.rowCount()
-            self.country_table.insertRow(row)
-            self.country_table.setItem(row, 0, QTableWidgetItem(country))
-            self.country_table.setItem(row, 1, NumericTableWidgetItem(count, str(count)))
-            self.country_table.setItem(row, 2, NumericTableWidgetItem(avg_latency, f"{avg_latency:.2f}"))
-            self.country_table.setItem(row, 3, NumericTableWidgetItem(avg_speed, f"{avg_speed:.2f}"))
-
     def start_latency_test(self):
         if not self.all_targets:
             QMessageBox.warning(self, "提示", "请先导入本地TXT或远程TXT链接。")
@@ -917,8 +901,6 @@ class MainWindow(QWidget):
 
         self.latency_results = []
         self.results = []
-        self.table.setRowCount(0)
-        self.country_table.setRowCount(0)
         self.log_edit.clear()
         self.reset_progress()
 
@@ -926,7 +908,6 @@ class MainWindow(QWidget):
         self.worker = LatencyTestWorker(selected_targets, threads)
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.update_progress)
-        self.worker.result_signal.connect(self.on_latency_result)
         self.worker.finished_signal.connect(self.on_latency_finished)
         self.worker.start()
 
@@ -937,16 +918,10 @@ class MainWindow(QWidget):
         selected_countries = ", ".join(self.get_selected_countries())
         self.append_log(f"开始延迟测试，已勾选国家：{selected_countries}")
 
-    def on_latency_result(self, item):
-        self.latency_results.append(item)
-        self.add_result_row(item)
-        self.update_country_stats(self.latency_results)
-
     def on_latency_finished(self, results):
         self.latency_results = results
         self.btn_latency.setEnabled(True)
         self.btn_speed.setEnabled(True if results else False)
-        self.update_country_stats(results)
         self.set_status("延迟测试完成")
         self.append_log(f"延迟测试完成，保留 {len(results)} 个有延迟节点。")
 
@@ -956,14 +931,12 @@ class MainWindow(QWidget):
             return
 
         self.results = []
-        self.table.setRowCount(0)
         self.reset_progress()
 
         threads = self.thread_input.value()
         self.worker = SpeedTestWorker(self.latency_results, threads)
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.update_progress)
-        self.worker.result_signal.connect(self.on_speed_result)
         self.worker.finished_signal.connect(self.on_speed_finished)
         self.worker.start()
 
@@ -972,16 +945,10 @@ class MainWindow(QWidget):
         self.set_status("测速中")
         self.append_log("开始测速（仅针对有延迟节点）...")
 
-    def on_speed_result(self, item):
-        self.results.append(item)
-        self.add_result_row(item)
-        self.update_country_stats(self.results)
-
     def on_speed_finished(self, results):
         self.results = results
         self.btn_latency.setEnabled(True)
         self.btn_speed.setEnabled(True)
-        self.update_country_stats(results)
         self.set_status("测速完成")
         self.append_log(f"测速完成，共得到 {len(results)} 条结果。")
 
@@ -994,32 +961,14 @@ class MainWindow(QWidget):
     def clear_results(self):
         self.latency_results = []
         self.results = []
-        self.table.setRowCount(0)
-        self.country_table.setRowCount(0)
         self.log_edit.clear()
         self.reset_progress()
         self.set_status("空闲")
 
-    def copy_row_content(self, row, column):
-        raw_item = self.table.item(row, 0)
-        ip_item = self.table.item(row, 1)
-        port_item = self.table.item(row, 2)
-
-        text = ""
-        if raw_item and raw_item.text().strip():
-            text = raw_item.text().strip()
-        elif ip_item and port_item:
-            text = format_ip_port(ip_item.text().strip(), int(port_item.text().strip()))
-
-        if text:
-            QApplication.clipboard().setText(text)
-            self.append_log(f"已复制：{text}")
-
-    def export_results(self):
+    def prepare_export_items(self):
         data_to_export = self.results if self.results else self.latency_results
         if not data_to_export:
-            QMessageBox.warning(self, "提示", "没有可导出的结果。")
-            return
+            return None, "没有可导出的结果。"
 
         countries = split_countries(self.country_input.text())
         topn_each = self.topn_input.value()
@@ -1041,32 +990,67 @@ class MainWindow(QWidget):
             export_items.extend(items)
 
         if not export_items:
-            QMessageBox.warning(self, "提示", "没有符合筛选条件的结果。")
+            return None, "没有符合筛选条件的结果。"
+
+        return export_items, None
+
+    def export_results_local(self):
+        export_items, err = self.prepare_export_items()
+        if err:
+            QMessageBox.warning(self, "提示", err)
             return
 
+        filename = ensure_txt_filename(self.export_name_edit.text())
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "保存结果",
-            "export_result.txt",
+            filename,
             "Text Files (*.txt)"
         )
         if not save_path:
             return
 
+        content = build_export_text(export_items)
         with open(save_path, "w", encoding="utf-8") as f:
-            for item in export_items:
-                raw_line = item.get("raw_line", "").strip()
-                if raw_line:
-                    f.write(raw_line + "\n")
-                else:
-                    ip_port = format_ip_port(item["ip"], item["port"])
-                    f.write(f"{ip_port}#{item.get('country', 'UNKNOWN')}\n")
+            f.write(content)
 
-        QMessageBox.information(
-            self,
-            "完成",
-            f"已导出 {len(export_items)} 条结果到：\n{save_path}\n\n导出格式已尽量保持与导入TXT一致。"
-        )
+        self.append_log(f"已导出 {len(export_items)} 条结果到本地：{save_path}")
+        QMessageBox.information(self, "完成", f"已导出到本地：\n{save_path}")
+
+    def export_results_webdav(self):
+        export_items, err = self.prepare_export_items()
+        if err:
+            QMessageBox.warning(self, "提示", err)
+            return
+
+        base_url = self.webdav_url_edit.text().strip()
+        username = self.webdav_user_edit.text().strip()
+        password = self.webdav_pass_edit.text()
+        remote_dir = self.webdav_dir_edit.text().strip()
+        filename = ensure_txt_filename(self.export_name_edit.text())
+
+        if not base_url:
+            QMessageBox.warning(self, "提示", "请输入WebDAV地址。")
+            return
+        if not username:
+            QMessageBox.warning(self, "提示", "请输入WebDAV用户名。")
+            return
+
+        try:
+            content = build_export_text(export_items).encode("utf-8")
+            status, full_url = upload_to_webdav(
+                base_url=base_url,
+                remote_dir=remote_dir,
+                filename=filename,
+                content=content,
+                username=username,
+                password=password
+            )
+            self.append_log(f"已导出 {len(export_items)} 条结果到WebDAV：{full_url} (HTTP {status})")
+            QMessageBox.information(self, "完成", f"已成功上传到 WebDAV：\n{full_url}")
+        except Exception as e:
+            self.append_log(f"导出到WebDAV失败：{e}")
+            QMessageBox.warning(self, "失败", f"导出到WebDAV失败：\n{e}")
 
 
 if __name__ == "__main__":
