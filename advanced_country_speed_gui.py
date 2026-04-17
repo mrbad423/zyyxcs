@@ -249,7 +249,6 @@ def timed_download_speed_test(ip: str, port: int, stop_event: threading.Event,
 
         header_data = b""
         header_done = False
-        body_size = 0
         measured_body_size = 0
 
         while time.time() - start < duration_sec:
@@ -266,11 +265,9 @@ def timed_download_speed_test(ip: str, port: int, stop_event: threading.Event,
                     if b"\r\n\r\n" in header_data:
                         header_done = True
                         body = header_data.split(b"\r\n\r\n", 1)[1]
-                        body_size += len(body)
                         if now >= measure_start:
                             measured_body_size += len(body)
                 else:
-                    body_size += len(buf)
                     if now >= measure_start:
                         measured_body_size += len(buf)
 
@@ -752,7 +749,10 @@ class SpeedTestWorker(QThread):
                 except Exception as e:
                     self.log.emit(f"[{completed}/{len(self.targets)}] 测速异常: {e}")
 
-        results.sort(key=lambda x: (x.get("score", 0.0), x.get("download_speed", 0.0)), reverse=True)
+        results.sort(
+            key=lambda x: (x.get("score", 0.0), x.get("download_speed", 0.0)),
+            reverse=True
+        )
         self.finished_signal.emit(results)
 
 
@@ -849,7 +849,7 @@ class MainWindow(QWidget):
         self.speed_topn_input = QSpinBox()
         self.speed_topn_input.setRange(1, 100000)
         self.speed_topn_input.setValue(50)
-        self.speed_topn_input.setToolTip("延迟测试后，仅取前N个节点进入测速")
+        self.speed_topn_input.setToolTip("每个勾选国家在延迟测试后，仅取前N个低延迟节点进入测速")
 
         row4.addWidget(QLabel("导出筛选国家:"))
         row4.addWidget(self.country_input)
@@ -857,7 +857,7 @@ class MainWindow(QWidget):
         row4.addWidget(QLabel("每国前N条:"))
         row4.addWidget(self.topn_input)
         row4.addSpacing(12)
-        row4.addWidget(QLabel("进入测速前N个:"))
+        row4.addWidget(QLabel("每国进入测速前N个:"))
         row4.addWidget(self.speed_topn_input)
 
         import_layout.addLayout(row4)
@@ -1472,14 +1472,37 @@ class MainWindow(QWidget):
     def on_latency_finished(self, results):
         self.latency_results = results
         topn = self.speed_topn_input.value()
-        self.speed_candidates = results[:topn]
+
+        grouped = defaultdict(list)
+        for item in results:
+            country = item.get("country", "UNKNOWN").upper()
+            grouped[country].append(item)
+
+        selected_countries = self.get_selected_countries()
+        speed_candidates = []
+
+        self.append_log("按国家分别筛选进入测速的候选节点：")
+        for country in selected_countries:
+            items = grouped.get(country, [])
+            items.sort(key=lambda x: x.get("latency", 999999.0))
+            picked = items[:topn]
+            speed_candidates.extend(picked)
+
+            self.append_log(
+                f"  {country}: 有延迟 {len(items)} 个，进入测速 {len(picked)} 个（前 {topn} 个）"
+            )
+
+        self.speed_candidates = speed_candidates
 
         self.btn_latency.setEnabled(True)
         self.btn_speed.setEnabled(True if self.speed_candidates else False)
         self.set_status("延迟测试完成")
 
         self.append_log(f"延迟测试完成，保留 {len(results)} 个有延迟节点。")
-        self.append_log(f"进入测速候选节点数：{len(self.speed_candidates)} / {len(results)}（取前 {topn} 个最低延迟）")
+        self.append_log(
+            f"已按每个勾选国家分别取前 {topn} 个低延迟节点进入测速，"
+            f"最终测速候选总数：{len(self.speed_candidates)}"
+        )
 
     def start_speed_test(self):
         if not self.speed_candidates:
@@ -1496,6 +1519,14 @@ class MainWindow(QWidget):
 
         speed_weight = speed_weight / total_weight
         latency_weight = latency_weight / total_weight
+
+        grouped = defaultdict(int)
+        for item in self.speed_candidates:
+            grouped[item.get("country", "UNKNOWN").upper()] += 1
+
+        self.append_log("本次进入测速的国家分布：")
+        for country in self.get_selected_countries():
+            self.append_log(f"  {country}: {grouped.get(country, 0)} 个")
 
         self.results = []
         self.reset_progress()
@@ -1570,7 +1601,10 @@ class MainWindow(QWidget):
         for country in target_countries:
             items = grouped.get(country, [])
             if self.results:
-                items.sort(key=lambda x: (x.get("score", 0.0), x.get("download_speed", 0.0)), reverse=True)
+                items.sort(
+                    key=lambda x: (x.get("score", 0.0), x.get("download_speed", 0.0)),
+                    reverse=True
+                )
             else:
                 items.sort(key=lambda x: x.get("latency", 999999.0))
 
