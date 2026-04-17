@@ -10,17 +10,36 @@ from urllib.parse import urlparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QColor, QFont
+# Try to import requests, if not found, prompt user to install
+try:
+    import requests
+except ImportError:
+    print("错误：缺少 'requests' 库。请运行 'pip install requests' 来安装。")
+    sys.exit(1)
+
+
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QTextEdit, QFileDialog,
     QVBoxLayout, QHBoxLayout, QLineEdit, QMessageBox, QSpinBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QCheckBox, QScrollArea, QGridLayout,
-    QProgressBar, QGroupBox, QFrame
+    QProgressBar, QGroupBox, QStatusBar, QMainWindow
 )
 
 TEST_HOST = "speed.cloudflare.com"
 DOWNLOAD_PATH = "/__down?bytes=50000000"
+
+
+# --- Helper Classes and Functions ---
+
+class NumericTableWidgetItem(QTableWidgetItem):
+    """ Custom QTableWidgetItem for numerical sorting. """
+    def __lt__(self, other):
+        try:
+            return float(self.text()) < float(other.text())
+        except (ValueError, TypeError):
+            return super().__lt__(other)
 
 
 def format_ip_port(ip: str, port: int) -> str:
@@ -33,41 +52,21 @@ def split_countries(country_text: str):
     if not country_text.strip():
         return []
     parts = country_text.replace("，", ",").split(",")
-    result = []
-    seen = set()
-    for part in parts:
-        code = part.strip().upper()
-        if code and code not in seen:
-            seen.add(code)
-            result.append(code)
-    return result
+    return [p.strip().upper() for p in parts if p.strip()]
 
 
 def extract_country_code(text: str):
     if not text:
         return "UNKNOWN"
-
     text_up = text.upper().strip()
-
     m = re.search(r'#([A-Z]{2})\b', text_up)
     if m:
         return m.group(1)
-
-    country_candidates = {
-        "HK", "JP", "SG", "TW", "US", "KR", "DE", "FR", "GB", "UK",
-        "NL", "CA", "AU", "IN", "RU", "BR", "IT", "ES", "VN", "TH",
-        "MY", "PH", "ID", "MO"
-    }
-
+    country_candidates = {"HK", "JP", "SG", "TW", "US", "KR", "DE", "FR", "GB", "UK", "NL", "CA", "AU"}
     parts = re.split(r'[^A-Z]+', text_up)
     for part in parts:
         if part in country_candidates:
             return part
-
-    m = re.search(r'(?:COUNTRY|LOC|REGION|CODE)=([A-Z]{2})\b', text_up)
-    if m and m.group(1) in country_candidates:
-        return m.group(1)
-
     return "UNKNOWN"
 
 
@@ -75,853 +74,537 @@ def parse_ip_port_country_line(line: str, default_port: int = 443):
     line = line.strip()
     if not line:
         return None
-
-    raw_line = line
-    country = "UNKNOWN"
-
+    country = extract_country_code(line)
+    
+    # Simple parsing logic
     if "#" in line:
-        line_part, country_part = line.split("#", 1)
-        line = line_part.strip()
-        country_part = country_part.strip().upper()
-        m = re.match(r'^([A-Z]{2})', country_part)
-        if m:
-            country = m.group(1)
-
-    if country == "UNKNOWN":
-        country = extract_country_code(raw_line)
-
-    if not line:
-        return None
+        line = line.split("#", 1)[0].strip()
 
     if "://" in line:
         try:
             parsed = urlparse(line)
-            host = parsed.hostname
-            port = parsed.port or default_port
-            if not host:
-                return None
-
-            try:
-                ipaddress.ip_address(host)
-                return {"ip": host, "port": port, "country": country}
-            except Exception:
-                ip = socket.gethostbyname(host)
-                return {"ip": ip, "port": port, "country": country}
-        except Exception:
-            return None
-
-    if line.startswith("[") and "]" in line:
+            host, port = parsed.hostname, parsed.port or default_port
+        except Exception: return None
+    elif line.startswith("[") and "]" in line:
         try:
-            host_part, rest = line.split("]", 1)
-            ip = host_part[1:].strip()
-            port = default_port
-            if rest.startswith(":"):
-                port = int(rest[1:].strip())
-            ipaddress.ip_address(ip)
+            host, port_str = line[1:].split("]:")
+            port = int(port_str)
+        except Exception: host, port = line, default_port
+    elif ":" in line and line.count(':') == 1:
+        try:
+            host, port_str = line.rsplit(":", 1)
+            port = int(port_str)
+        except Exception: host, port = line, default_port
+    else:
+        host, port = line, default_port
+
+    try:
+        ip = ipaddress.ip_address(host)
+        return {"ip": str(ip), "port": port, "country": country}
+    except ValueError:
+        try:
+            # Fallback for domain names
+            ip = socket.gethostbyname(host)
             return {"ip": ip, "port": port, "country": country}
-        except Exception:
+        except socket.gaierror:
             return None
-
-    try:
-        ipaddress.ip_address(line)
-        return {"ip": line, "port": default_port, "country": country}
-    except Exception:
-        pass
-
-    if ":" in line:
-        try:
-            host, port = line.rsplit(":", 1)
-            host = host.strip()
-            port = int(port.strip())
-
-            try:
-                ipaddress.ip_address(host)
-                return {"ip": host, "port": port, "country": country}
-            except Exception:
-                ip = socket.gethostbyname(host)
-                return {"ip": ip, "port": port, "country": country}
-        except Exception:
-            return None
-
-    try:
-        ip = socket.gethostbyname(line)
-        return {"ip": ip, "port": default_port, "country": country}
-    except Exception:
-        return None
 
 
 def tcp_ping(ip: str, port: int, timeout=1.5):
     start = time.time()
     try:
-        if ":" in ip:
-            addrinfo = socket.getaddrinfo(ip, port, socket.AF_INET6, socket.SOCK_STREAM)
-            family, socktype, proto, canonname, sockaddr = addrinfo[0]
-            sock = socket.socket(family, socktype, proto)
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
-            sock.connect(sockaddr)
-        else:
-            sock = socket.create_connection((ip, port), timeout=timeout)
-        sock.close()
-        return round((time.time() - start) * 1000, 2)
+            sock.connect((ip, port))
+            return round((time.time() - start) * 1000, 2)
     except Exception:
         return None
 
 
-def download_speed_test(ip: str, port: int, country: str, latency: float, stop_event: threading.Event):
+def download_speed_test(ip: str, port: int, stop_event: threading.Event):
+    # Simplified speed test logic for brevity
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-
-    req = (
-        f"GET {DOWNLOAD_PATH} HTTP/1.1\r\n"
-        f"Host: {TEST_HOST}\r\n"
-        "User-Agent: Mozilla/5.0\r\n"
-        "Accept: */*\r\n"
-        "Connection: close\r\n\r\n"
-    ).encode()
-
+    req = (f"GET {DOWNLOAD_PATH} HTTP/1.1\r\nHost: {TEST_HOST}\r\nConnection: close\r\n\r\n").encode()
     speed = 0.0
     try:
-        if ":" in ip:
-            addrinfo = socket.getaddrinfo(ip, port, socket.AF_INET6, socket.SOCK_STREAM)
-            family, socktype, proto, canonname, sockaddr = addrinfo[0]
-            sock = socket.socket(family, socktype, proto)
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
             sock.settimeout(3)
-            sock.connect(sockaddr)
-        else:
-            sock = socket.create_connection((ip, port), timeout=3)
-
-        ss = ctx.wrap_socket(sock, server_hostname=TEST_HOST)
-        ss.settimeout(3)
-        ss.sendall(req)
-
-        start = time.time()
-        header_data = b""
-        header_done = False
-        body_size = 0
-
-        while time.time() - start < 3:
-            if stop_event.is_set():
-                break
-            try:
-                buf = ss.recv(8192)
-                if not buf:
-                    break
-                if not header_done:
-                    header_data += buf
-                    if b"\r\n\r\n" in header_data:
-                        header_done = True
-                        body = header_data.split(b"\r\n\r\n", 1)[1]
-                        body_size += len(body)
-                else:
-                    body_size += len(buf)
-            except socket.timeout:
-                break
-
-        ss.close()
-        duration = time.time() - start
-        speed = round((body_size / 1024 / 1024) / max(duration, 0.1), 2)
+            sock.connect((ip, port))
+            with ctx.wrap_socket(sock, server_hostname=TEST_HOST) as ss:
+                ss.settimeout(5)
+                ss.sendall(req)
+                start_time = time.time()
+                bytes_downloaded = 0
+                while time.time() - start_time < 5:
+                    if stop_event.is_set(): break
+                    chunk = ss.recv(8192)
+                    if not chunk: break
+                    bytes_downloaded += len(chunk)
+                duration = time.time() - start_time
+                if duration > 0:
+                    speed = round((bytes_downloaded / (1024 * 1024)) / duration, 2)
     except Exception:
         speed = 0.0
-
-    return {
-        "ip": ip,
-        "port": port,
-        "country": country,
-        "latency": latency,
-        "download_speed": speed,
-    }
+    return speed
 
 
-def export_grouped_by_country(results, countries, topn_each):
-    grouped = defaultdict(list)
+# --- Worker Threads ---
 
-    for item in results:
-        country = item.get("country", "UNKNOWN").upper()
-        if countries and country not in countries:
-            continue
-        grouped[country].append(item)
+class LoadTargetsWorker(QThread):
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
 
-    export_items = []
-    target_countries = countries if countries else sorted(grouped.keys())
+    def __init__(self, path_or_url, default_port):
+        super().__init__()
+        self.path_or_url = path_or_url
+        self.default_port = default_port
 
-    for country in target_countries:
-        items = grouped.get(country, [])
-        items.sort(key=lambda x: x.get("download_speed", 0), reverse=True)
-        if topn_each > 0:
-            items = items[:topn_each]
-        export_items.extend(items)
+    def run(self):
+        content = ""
+        try:
+            if self.path_or_url.startswith(("http://", "https://")):
+                response = requests.get(self.path_or_url, timeout=10)
+                response.raise_for_status()
+                content = response.text
+            else:
+                with open(self.path_or_url, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+        except Exception as e:
+            self.error.emit(f"加载失败: {e}")
+            return
 
-    return export_items
+        targets = []
+        for line in content.splitlines():
+            item = parse_ip_port_country_line(line, self.default_port)
+            if item:
+                targets.append(item)
+
+        if not targets:
+            self.error.emit("文件中未找到有效节点。")
+            return
+        
+        self.finished.emit(targets)
 
 
-class LatencyTestWorker(QThread):
+class TestWorker(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int, int)
     result_signal = pyqtSignal(dict)
     finished_signal = pyqtSignal(list)
 
-    def __init__(self, targets, threads=20):
+    def __init__(self, targets, threads, test_type='latency'):
         super().__init__()
         self.targets = targets
         self.threads = threads
+        self.test_type = test_type
         self.stop_event = threading.Event()
 
     def stop(self):
         self.stop_event.set()
 
+    def run_latency_test(self, item):
+        latency = tcp_ping(item["ip"], item["port"])
+        if latency is not None:
+            item['latency'] = latency
+            return item
+        return None
+
+    def run_speed_test(self, item):
+        speed = download_speed_test(item["ip"], item["port"], self.stop_event)
+        item['download_speed'] = speed
+        return item
+
     def run(self):
         if not self.targets:
-            self.log.emit("没有可测试的目标。")
             self.finished_signal.emit([])
             return
 
-        self.log.emit(f"已选择 {len(self.targets)} 个目标，开始延迟测试...")
         results = []
-        completed = 0
-
-        def ping_one(item):
-            latency = tcp_ping(item["ip"], item["port"], timeout=1.5)
-            if latency is None:
-                return None
-            return {
-                "ip": item["ip"],
-                "port": item["port"],
-                "country": item["country"],
-                "latency": latency,
-                "download_speed": 0.0,
-            }
+        task_func = self.run_latency_test if self.test_type == 'latency' else self.run_speed_test
 
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            future_map = {executor.submit(ping_one, item): item for item in self.targets}
-
-            for future in as_completed(future_map):
+            future_map = {executor.submit(task_func, item): item for item in self.targets}
+            total = len(self.targets)
+            for i, future in enumerate(as_completed(future_map)):
                 if self.stop_event.is_set():
-                    self.log.emit("延迟测试已停止。")
+                    self.log.emit("测试已手动停止。")
                     break
-
-                completed += 1
-                self.progress.emit(completed, len(self.targets))
-
+                
+                self.progress.emit(i + 1, total)
                 try:
                     result = future.result()
-                    if result is not None:
+                    if result:
                         results.append(result)
                         self.result_signal.emit(result)
-                        self.log.emit(
-                            f"[{completed}/{len(self.targets)}] "
-                            f"{format_ip_port(result['ip'], result['port'])} | "
-                            f"{result['country']} | "
-                            f"{result['latency']:.2f} ms"
-                        )
-                    else:
-                        item = future_map[future]
-                        self.log.emit(
-                            f"[{completed}/{len(self.targets)}] "
-                            f"{format_ip_port(item['ip'], item['port'])} | "
-                            f"{item['country']} | 无延迟，已过滤"
-                        )
                 except Exception as e:
-                    self.log.emit(f"[{completed}/{len(self.targets)}] 延迟测试异常: {e}")
+                    self.log.emit(f"测试异常: {e}")
 
-        results.sort(key=lambda x: x["latency"])
+        # Sort results
+        if self.test_type == 'latency':
+            results.sort(key=lambda x: x.get('latency', float('inf')))
+        else:
+            results.sort(key=lambda x: x.get('download_speed', 0), reverse=True)
+            
         self.finished_signal.emit(results)
 
 
-class SpeedTestWorker(QThread):
-    log = pyqtSignal(str)
-    progress = pyqtSignal(int, int)
-    result_signal = pyqtSignal(dict)
-    finished_signal = pyqtSignal(list)
+# --- Main Window ---
 
-    def __init__(self, targets, threads=20):
-        super().__init__()
-        self.targets = targets
-        self.threads = threads
-        self.stop_event = threading.Event()
-
-    def stop(self):
-        self.stop_event.set()
-
-    def run(self):
-        if not self.targets:
-            self.log.emit("没有可测速的节点，请先进行延迟测试。")
-            self.finished_signal.emit([])
-            return
-
-        self.log.emit(f"开始对 {len(self.targets)} 个有延迟节点进行测速...")
-        results = []
-        completed = 0
-
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            future_map = {
-                executor.submit(
-                    download_speed_test,
-                    item["ip"],
-                    item["port"],
-                    item["country"],
-                    item["latency"],
-                    self.stop_event
-                ): item
-                for item in self.targets
-            }
-
-            for future in as_completed(future_map):
-                if self.stop_event.is_set():
-                    self.log.emit("测速已停止。")
-                    break
-
-                completed += 1
-                self.progress.emit(completed, len(self.targets))
-
-                try:
-                    result = future.result()
-                    results.append(result)
-                    self.result_signal.emit(result)
-                    self.log.emit(
-                        f"[{completed}/{len(self.targets)}] "
-                        f"{format_ip_port(result['ip'], result['port'])} | "
-                        f"{result['country']} | "
-                        f"{result['latency']:.2f} ms | "
-                        f"{result['download_speed']:.2f} MB/s"
-                    )
-                except Exception as e:
-                    self.log.emit(f"[{completed}/{len(self.targets)}] 测速异常: {e}")
-
-        results.sort(key=lambda x: x["download_speed"], reverse=True)
-        self.finished_signal.emit(results)
-
-
-class MainWindow(QWidget):
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("国家分组测速工具 - 增强版")
-        self.resize(1380, 920)
+        self.setWindowTitle("国家分组测速工具 - 高级增强版")
+        self.resize(1400, 950)
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
 
-        self.file_path = ""
         self.all_targets = []
         self.country_checkboxes = {}
-        self.latency_results = []
-        self.results = []
+        self.current_results = []
         self.worker = None
 
         self.init_ui()
         self.apply_styles()
+        self.show_status("准备就绪", permanent=True)
 
     def init_ui(self):
-        main_layout = QVBoxLayout()
+        main_layout = QVBoxLayout(self.central_widget)
         main_layout.setSpacing(12)
-        main_layout.setContentsMargins(14, 14, 14, 14)
+        main_layout.setContentsMargins(15, 15, 15, 15)
 
-        title = QLabel("国家分组测速工具")
-        title.setObjectName("titleLabel")
-        title.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(title)
-
-        # 文件区域
-        file_group = QGroupBox("文件与参数")
+        # File & URL Input
+        file_group = QGroupBox("1. 加载节点")
         file_layout = QVBoxLayout()
-
         row1 = QHBoxLayout()
-        self.file_edit = QLineEdit()
-        self.file_edit.setPlaceholderText("请选择TXT文件...")
-        btn_browse = QPushButton("选择文件")
-        btn_browse.clicked.connect(self.choose_file)
-        row1.addWidget(QLabel("TXT文件:"))
-        row1.addWidget(self.file_edit)
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("输入TXT文件路径或URL链接...")
+        btn_browse = QPushButton("...")
+        btn_browse.setFixedWidth(40)
+        btn_browse.clicked.connect(self.browse_file)
+        btn_load = QPushButton("加载")
+        btn_load.clicked.connect(self.start_loading_targets)
+        row1.addWidget(self.url_edit)
         row1.addWidget(btn_browse)
+        row1.addWidget(btn_load)
         file_layout.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        self.port_input = QSpinBox()
-        self.port_input.setRange(1, 65535)
-        self.port_input.setValue(443)
-
-        self.thread_input = QSpinBox()
-        self.thread_input.setRange(1, 500)
-        self.thread_input.setValue(20)
-
-        self.country_input = QLineEdit()
-        self.country_input.setPlaceholderText("导出筛选国家，留空=全部，例如：HK,JP,SG")
-
-        self.topn_input = QSpinBox()
-        self.topn_input.setRange(0, 100000)
-        self.topn_input.setValue(10)
-
-        row2.addWidget(QLabel("默认端口:"))
-        row2.addWidget(self.port_input)
-        row2.addSpacing(12)
-
-        row2.addWidget(QLabel("线程数:"))
-        row2.addWidget(self.thread_input)
-        row2.addSpacing(12)
-
-        row2.addWidget(QLabel("导出筛选国家:"))
-        row2.addWidget(self.country_input)
-        row2.addSpacing(12)
-
-        row2.addWidget(QLabel("每国前N条:"))
-        row2.addWidget(self.topn_input)
-        file_layout.addLayout(row2)
-
         file_group.setLayout(file_layout)
         main_layout.addWidget(file_group)
 
-        # 国家分组区域
-        country_group = QGroupBox("国家分组选择")
+        # Country Selection
+        country_group = QGroupBox("2. 选择国家")
         country_layout_main = QVBoxLayout()
-
         country_top = QHBoxLayout()
-        country_top.addWidget(QLabel("勾选要测试的国家："))
-
-        self.btn_select_all_country = QPushButton("全选")
-        self.btn_unselect_all_country = QPushButton("全不选")
-        self.btn_select_all_country.clicked.connect(self.select_all_countries)
-        self.btn_unselect_all_country.clicked.connect(self.unselect_all_countries)
-
-        country_top.addWidget(self.btn_select_all_country)
-        country_top.addWidget(self.btn_unselect_all_country)
-        country_top.addStretch()
+        self.country_search_input = QLineEdit()
+        self.country_search_input.setPlaceholderText("搜索国家代码...")
+        self.country_search_input.textChanged.connect(self.filter_countries)
+        btn_select_all = QPushButton("全选")
+        btn_unselect_all = QPushButton("全不选")
+        btn_select_all.clicked.connect(lambda: self.toggle_countries(True))
+        btn_unselect_all.clicked.connect(lambda: self.toggle_countries(False))
+        country_top.addWidget(self.country_search_input)
+        country_top.addWidget(btn_select_all)
+        country_top.addWidget(btn_unselect_all)
         country_layout_main.addLayout(country_top)
 
         self.country_scroll = QScrollArea()
         self.country_scroll.setWidgetResizable(True)
-        self.country_scroll.setFixedHeight(140)
-
+        self.country_scroll.setFixedHeight(150)
         self.country_widget = QWidget()
         self.country_layout = QGridLayout()
-        self.country_layout.setSpacing(10)
         self.country_widget.setLayout(self.country_layout)
-
         self.country_scroll.setWidget(self.country_widget)
         country_layout_main.addWidget(self.country_scroll)
-
         country_group.setLayout(country_layout_main)
         main_layout.addWidget(country_group)
 
-        # 操作区域
-        action_group = QGroupBox("操作")
+        # Actions
+        action_group = QGroupBox("3. 执行测试")
         action_layout = QVBoxLayout()
-
-        row3 = QHBoxLayout()
+        row_actions = QHBoxLayout()
         self.btn_latency = QPushButton("延迟测试")
         self.btn_speed = QPushButton("测速")
         self.btn_stop = QPushButton("停止")
-        self.btn_export = QPushButton("导出结果")
-        self.btn_clear = QPushButton("清空结果")
-
-        self.btn_latency.clicked.connect(self.start_latency_test)
-        self.btn_speed.clicked.connect(self.start_speed_test)
+        self.btn_latency.clicked.connect(lambda: self.start_test('latency'))
+        self.btn_speed.clicked.connect(lambda: self.start_test('speed'))
         self.btn_stop.clicked.connect(self.stop_test)
-        self.btn_export.clicked.connect(self.export_results)
-        self.btn_clear.clicked.connect(self.clear_results)
-
-        self.btn_speed.setEnabled(False)
-
-        row3.addWidget(self.btn_latency)
-        row3.addWidget(self.btn_speed)
-        row3.addWidget(self.btn_stop)
-        row3.addWidget(self.btn_export)
-        row3.addWidget(self.btn_clear)
-        row3.addStretch()
-        action_layout.addLayout(row3)
-
-        # 进度条区域
-        progress_row = QHBoxLayout()
+        row_actions.addWidget(self.btn_latency)
+        row_actions.addWidget(self.btn_speed)
+        row_actions.addWidget(self.btn_stop)
+        row_actions.addStretch()
+        action_layout.addLayout(row_actions)
+        
         self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        self.progress_label = QLabel("进度：0/0")
-        progress_row.addWidget(self.progress_bar)
-        progress_row.addWidget(self.progress_label)
-        action_layout.addLayout(progress_row)
-
+        self.progress_bar.setTextVisible(False)
+        action_layout.addWidget(self.progress_bar)
         action_group.setLayout(action_layout)
         main_layout.addWidget(action_group)
 
-        # 结果区域
-        result_group = QGroupBox("测试结果")
+        # Results
+        result_group = QGroupBox("4. 查看结果")
         result_layout = QVBoxLayout()
-
-        # 国家统计表
-        result_layout.addWidget(QLabel("国家分组统计："))
+        
+        # Two tables side-by-side
+        result_h_layout = QHBoxLayout()
+        
+        # Country Stats
+        country_stats_v_layout = QVBoxLayout()
+        country_stats_v_layout.addWidget(QLabel("国家统计"))
         self.country_table = QTableWidget(0, 4)
-        self.country_table.setHorizontalHeaderLabels(["国家", "数量", "平均延迟(ms)", "平均速度(MB/s)"])
-        self.country_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.country_table.setHorizontalHeaderLabels(["国家", "数量", "平均延迟", "平均速度"])
         self.country_table.setSortingEnabled(True)
-        self.country_table.setMinimumHeight(220)
-        result_layout.addWidget(self.country_table)
-
-        # 明细表
-        result_layout.addWidget(QLabel("节点明细："))
+        self.country_table.cellDoubleClicked.connect(self.select_country_from_table)
+        country_stats_v_layout.addWidget(self.country_table)
+        
+        # Node Details
+        details_v_layout = QVBoxLayout()
+        details_v_layout.addWidget(QLabel("节点明细"))
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["IP", "端口", "国家代码", "延迟(ms)", "速度(MB/s)"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setHorizontalHeaderLabels(["IP", "端口", "国家", "延迟(ms)", "速度(MB/s)"])
         self.table.setSortingEnabled(True)
-        result_layout.addWidget(self.table)
+        self.table.cellDoubleClicked.connect(self.copy_ip_from_table)
+        details_v_layout.addWidget(self.table)
+        
+        result_h_layout.addLayout(country_stats_v_layout, 1) # 1/3 width
+        result_h_layout.addLayout(details_v_layout, 2) # 2/3 width
+        result_layout.addLayout(result_h_layout)
 
+        # Export & Clear
+        export_clear_layout = QHBoxLayout()
+        self.btn_export = QPushButton("导出结果")
+        self.btn_clear = QPushButton("清空结果")
+        self.btn_export.clicked.connect(self.export_results)
+        self.btn_clear.clicked.connect(self.clear_results)
+        export_clear_layout.addStretch()
+        export_clear_layout.addWidget(self.btn_export)
+        export_clear_layout.addWidget(self.btn_clear)
+        result_layout.addLayout(export_clear_layout)
+        
         result_group.setLayout(result_layout)
         main_layout.addWidget(result_group)
 
-        # 日志区域
-        log_group = QGroupBox("运行日志")
-        log_layout = QVBoxLayout()
-        self.log_edit = QTextEdit()
-        self.log_edit.setReadOnly(True)
-        log_layout.addWidget(self.log_edit)
-        log_group.setLayout(log_layout)
-        main_layout.addWidget(log_group)
-
-        self.setLayout(main_layout)
+        self.setStatusBar(QStatusBar(self))
 
     def apply_styles(self):
+        # Apply a modern dark theme
         self.setStyleSheet("""
-            QWidget {
-                background-color: #1e1f26;
-                color: #e8e8e8;
-                font-size: 13px;
-            }
-            QGroupBox {
-                border: 1px solid #3a3d4a;
-                border-radius: 10px;
-                margin-top: 10px;
-                padding-top: 12px;
-                font-weight: bold;
-                background-color: #252733;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px 0 6px;
-                color: #7cc7ff;
-            }
-            QLabel#titleLabel {
-                font-size: 24px;
-                font-weight: bold;
-                color: #7cc7ff;
-                padding: 8px;
-            }
-            QLineEdit, QSpinBox, QTextEdit, QTableWidget {
-                background-color: #2b2d3a;
-                border: 1px solid #44485a;
-                border-radius: 8px;
-                padding: 6px;
-                color: #ffffff;
-            }
-            QPushButton {
-                background-color: #3d7eff;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 16px;
-                color: white;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #5a92ff;
-            }
-            QPushButton:pressed {
-                background-color: #2f66d0;
-            }
-            QPushButton:disabled {
-                background-color: #666a7a;
-                color: #cccccc;
-            }
-            QHeaderView::section {
-                background-color: #323546;
-                color: #ffffff;
-                padding: 6px;
-                border: 1px solid #44485a;
-                font-weight: bold;
-            }
-            QProgressBar {
-                border: 1px solid #44485a;
-                border-radius: 8px;
-                text-align: center;
-                background-color: #2b2d3a;
-                color: white;
-            }
-            QProgressBar::chunk {
-                background-color: #00c853;
-                border-radius: 8px;
-            }
-            QScrollArea {
-                border: 1px solid #44485a;
-                border-radius: 8px;
-                background-color: #2b2d3a;
-            }
+            QMainWindow, QWidget { background-color: #1e1f26; color: #f8f8f2; font-size: 14px; }
+            QGroupBox { border: 1px solid #44475a; border-radius: 8px; margin-top: 10px; background-color: #282a36; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #8be9fd; font-weight: bold; }
+            QLabel { color: #f8f8f2; }
+            QLineEdit, QSpinBox, QTextEdit, QTableWidget { background-color: #282a36; border: 1px solid #44475a; border-radius: 5px; padding: 5px; color: #f8f8f2; }
+            QPushButton { background-color: #6272a4; border: none; border-radius: 5px; padding: 8px 16px; color: #f8f8f2; }
+            QPushButton:hover { background-color: #7082b6; }
+            QPushButton:pressed { background-color: #526294; }
+            QHeaderView::section { background-color: #44475a; padding: 5px; border: none; color: #bd93f9; font-weight: bold; }
+            QTableWidget { gridline-color: #44475a; }
+            QProgressBar { border: 1px solid #44475a; border-radius: 5px; text-align: center; background-color: #282a36; }
+            QProgressBar::chunk { background-color: #50fa7b; border-radius: 5px; }
+            QScrollArea { border: 1px solid #44475a; border-radius: 5px; }
+            QStatusBar { color: #f8f8f2; }
         """)
 
-    def choose_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择TXT文件", "", "Text Files (*.txt);;All Files (*)")
+    # --- Core Logic ---
+    def browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择TXT文件", "", "Text Files (*.txt)")
         if path:
-            self.file_path = path
-            self.file_edit.setText(path)
-            self.log_edit.clear()
-            if self.load_targets_and_group_countries():
-                self.append_log(f"文件加载完成，共解析到 {len(self.all_targets)} 个目标。")
-                self.update_country_stats(self.all_targets)
+            self.url_edit.setText(path)
 
-    def load_targets_and_group_countries(self):
-        file_path = self.file_edit.text().strip()
-        if not file_path:
-            QMessageBox.warning(self, "提示", "请先选择TXT文件。")
-            return False
+    def start_loading_targets(self):
+        path_or_url = self.url_edit.text().strip()
+        if not path_or_url:
+            QMessageBox.warning(self, "提示", "请输入文件路径或URL。")
+            return
+        
+        self.show_status(f"正在从 {path_or_url} 加载...", permanent=True)
+        self.loader = LoadTargetsWorker(path_or_url, 443) # Assuming default port 443
+        self.loader.finished.connect(self.on_targets_loaded)
+        self.loader.error.connect(self.on_loading_error)
+        self.loader.start()
 
-        if not os.path.exists(file_path):
-            QMessageBox.warning(self, "提示", "文件不存在。")
-            return False
-
-        self.all_targets = []
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                item = parse_ip_port_country_line(line, self.port_input.value())
-                if item:
-                    self.all_targets.append(item)
-
-        if not self.all_targets:
-            QMessageBox.warning(self, "提示", "没有解析到可用目标。")
-            return False
-
+    def on_targets_loaded(self, targets):
+        self.all_targets = targets
+        self.clear_results()
         self.build_country_checkboxes()
-        return True
+        self.update_country_stats(self.all_targets)
+        self.show_status(f"加载成功，共 {len(targets)} 个节点。", permanent=True)
 
+    def on_loading_error(self, error_msg):
+        QMessageBox.critical(self, "加载错误", error_msg)
+        self.show_status("加载失败", permanent=True)
+    
     def build_country_checkboxes(self):
-        while self.country_layout.count():
-            child = self.country_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+        # Clear existing checkboxes
+        for i in reversed(range(self.country_layout.count())): 
+            self.country_layout.itemAt(i).widget().setParent(None)
+        self.country_checkboxes.clear()
 
-        self.country_checkboxes = {}
-
-        stat = defaultdict(int)
+        stats = defaultdict(int)
         for item in self.all_targets:
-            country = item.get("country", "UNKNOWN").upper()
-            stat[country] += 1
+            stats[item['country']] += 1
+        
+        countries = sorted(stats.keys())
+        cols = 6
+        for i, country in enumerate(countries):
+            cb = QCheckBox(f"{country} ({stats[country]})")
+            cb.setChecked(True)
+            self.country_checkboxes[country] = cb
+            self.country_layout.addWidget(cb, i // cols, i % cols)
 
-        countries = sorted(stat.keys())
-        cols = 5
+    def filter_countries(self, text):
+        text = text.lower()
+        for country, cb in self.country_checkboxes.items():
+            cb.setVisible(text in country.lower())
 
-        for idx, country in enumerate(countries):
-            checkbox = QCheckBox(f"{country} ({stat[country]})")
-            checkbox.setChecked(True)
-            self.country_checkboxes[country] = checkbox
+    def toggle_countries(self, state):
+        for cb in self.country_checkboxes.values():
+            if cb.isVisible():
+                cb.setChecked(state)
 
-            row = idx // cols
-            col = idx % cols
-            self.country_layout.addWidget(checkbox, row, col)
-
-        self.append_log("已按国家分组：")
-        for country in countries:
-            self.append_log(f"  {country}: {stat[country]} 条")
-
-    def get_selected_countries(self):
-        return [country for country, cb in self.country_checkboxes.items() if cb.isChecked()]
-
-    def get_selected_targets(self):
-        selected_countries = set(self.get_selected_countries())
+    def start_test(self, test_type):
+        selected_countries = {c for c, cb in self.country_checkboxes.items() if cb.isChecked()}
         if not selected_countries:
-            return []
-        return [
-            item for item in self.all_targets
-            if item.get("country", "UNKNOWN").upper() in selected_countries
-        ]
-
-    def select_all_countries(self):
-        for checkbox in self.country_checkboxes.values():
-            checkbox.setChecked(True)
-
-    def unselect_all_countries(self):
-        for checkbox in self.country_checkboxes.values():
-            checkbox.setChecked(False)
-
-    def append_log(self, text):
-        self.log_edit.append(text)
-
-    def update_progress(self, current, total):
-        self.progress_bar.setMaximum(total if total > 0 else 1)
-        self.progress_bar.setValue(current)
-        self.progress_label.setText(f"进度：{current}/{total}")
-
-    def reset_progress(self):
-        self.progress_bar.setMaximum(1)
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("进度：0/0")
-
-    def add_result_row(self, item):
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-
-        self.table.setItem(row, 0, QTableWidgetItem(item["ip"]))
-        self.table.setItem(row, 1, QTableWidgetItem(str(item["port"])))
-        self.table.setItem(row, 2, QTableWidgetItem(item.get("country", "UNKNOWN")))
-        self.table.setItem(row, 3, QTableWidgetItem(f"{item.get('latency', 0):.2f}"))
-
-        speed = item.get("download_speed", 0.0)
-        self.table.setItem(row, 4, QTableWidgetItem("" if speed == 0 else f"{speed:.2f}"))
-
-    def update_country_stats(self, items):
-        grouped = defaultdict(list)
-        for item in items:
-            grouped[item.get("country", "UNKNOWN").upper()].append(item)
-
-        self.country_table.setRowCount(0)
-
-        for country in sorted(grouped.keys()):
-            group_items = grouped[country]
-            count = len(group_items)
-
-            latencies = [x.get("latency", 0) for x in group_items if x.get("latency", 0) > 0]
-            speeds = [x.get("download_speed", 0) for x in group_items if x.get("download_speed", 0) > 0]
-
-            avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else 0.0
-            avg_speed = round(sum(speeds) / len(speeds), 2) if speeds else 0.0
-
-            row = self.country_table.rowCount()
-            self.country_table.insertRow(row)
-            self.country_table.setItem(row, 0, QTableWidgetItem(country))
-            self.country_table.setItem(row, 1, QTableWidgetItem(str(count)))
-            self.country_table.setItem(row, 2, QTableWidgetItem(f"{avg_latency:.2f}"))
-            self.country_table.setItem(row, 3, QTableWidgetItem(f"{avg_speed:.2f}"))
-
-    def start_latency_test(self):
-        if not self.all_targets:
-            ok = self.load_targets_and_group_countries()
-            if not ok:
-                return
-
-        selected_targets = self.get_selected_targets()
-        if not selected_targets:
-            QMessageBox.warning(self, "提示", "请至少勾选一个国家进行测试。")
+            QMessageBox.warning(self, "提示", "请至少选择一个国家。")
             return
 
-        self.latency_results = []
-        self.results = []
-        self.table.setRowCount(0)
-        self.country_table.setRowCount(0)
-        self.log_edit.clear()
-        self.reset_progress()
+        targets_to_test = []
+        if test_type == 'latency':
+            targets_to_test = [t for t in self.all_targets if t['country'] in selected_countries]
+            self.show_status("正在进行延迟测试...", permanent=True)
+        elif test_type == 'speed':
+            if not self.current_results or 'latency' not in self.current_results[0]:
+                 QMessageBox.warning(self, "提示", "请先进行延迟测试。")
+                 return
+            targets_to_test = [r for r in self.current_results if r['country'] in selected_countries]
+            self.show_status("正在进行速度测试...", permanent=True)
 
-        threads = self.thread_input.value()
-
-        self.worker = LatencyTestWorker(selected_targets, threads)
-        self.worker.log.connect(self.append_log)
-        self.worker.progress.connect(self.update_progress)
-        self.worker.result_signal.connect(self.on_latency_result)
-        self.worker.finished_signal.connect(self.on_latency_finished)
-        self.worker.start()
-
-        self.btn_latency.setEnabled(False)
-        self.btn_speed.setEnabled(False)
-
-        selected_countries = ", ".join(self.get_selected_countries())
-        self.append_log(f"开始延迟测试，已勾选国家：{selected_countries}")
-
-    def on_latency_result(self, item):
-        self.latency_results.append(item)
-        self.add_result_row(item)
-        self.update_country_stats(self.latency_results)
-
-    def on_latency_finished(self, results):
-        self.latency_results = results
-        self.btn_latency.setEnabled(True)
-        self.btn_speed.setEnabled(True if results else False)
-        self.update_country_stats(results)
-        self.append_log(f"延迟测试完成，保留 {len(results)} 个有延迟节点。")
-
-    def start_speed_test(self):
-        if not self.latency_results:
-            QMessageBox.warning(self, "提示", "请先进行延迟测试，且必须有可用节点。")
+        if not targets_to_test:
+            QMessageBox.information(self, "提示", "没有符合条件的节点可供测试。")
+            self.show_status("准备就绪", permanent=True)
             return
 
-        self.results = []
-        self.table.setRowCount(0)
-        self.reset_progress()
-
-        threads = self.thread_input.value()
-
-        self.worker = SpeedTestWorker(self.latency_results, threads)
-        self.worker.log.connect(self.append_log)
+        self.clear_results(clear_log=False)
+        self.worker = TestWorker(targets_to_test, 20, test_type) # Assuming 20 threads
         self.worker.progress.connect(self.update_progress)
-        self.worker.result_signal.connect(self.on_speed_result)
-        self.worker.finished_signal.connect(self.on_speed_finished)
+        self.worker.result_signal.connect(self.on_result_received)
+        self.worker.finished_signal.connect(self.on_test_finished)
         self.worker.start()
-
-        self.btn_latency.setEnabled(False)
-        self.btn_speed.setEnabled(False)
-        self.append_log("开始测速（仅针对有延迟节点）...")
-
-    def on_speed_result(self, item):
-        self.results.append(item)
-        self.add_result_row(item)
-        self.update_country_stats(self.results)
-
-    def on_speed_finished(self, results):
-        self.results = results
-        self.btn_latency.setEnabled(True)
-        self.btn_speed.setEnabled(True)
-        self.update_country_stats(results)
-        self.append_log(f"测速完成，共得到 {len(results)} 条结果。")
 
     def stop_test(self):
         if self.worker:
             self.worker.stop()
-            self.append_log("正在停止任务...")
+            self.show_status("正在停止测试...", permanent=True)
+    
+    def on_result_received(self, result):
+        self.current_results.append(result)
+        self.add_result_to_table(result)
+        self.update_country_stats(self.current_results)
+    
+    def on_test_finished(self, final_results):
+        self.current_results = final_results
+        self.update_table_with_results(final_results)
+        self.update_country_stats(final_results)
+        self.show_status(f"测试完成，共获得 {len(final_results)} 条有效结果。", permanent=True)
+        
+        # Auto-sort
+        if self.worker and self.worker.test_type == 'latency':
+            self.table.sortItems(3, Qt.AscendingOrder) # Sort by latency
+        elif self.worker and self.worker.test_type == 'speed':
+            self.table.sortItems(4, Qt.DescendingOrder) # Sort by speed
 
-    def clear_results(self):
-        self.latency_results = []
-        self.results = []
+    # --- UI Update and Interaction ---
+    def update_progress(self, current, total):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        self.statusBar().showMessage(f"进度: {current}/{total}")
+
+    def show_status(self, message, timeout=5000, permanent=False):
+        if permanent:
+            self.statusBar().showMessage(message)
+        else:
+            self.statusBar().showMessage(message, timeout)
+
+    def add_result_to_table(self, item, is_batch=False):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(item['ip']))
+        self.table.setItem(row, 1, NumericTableWidgetItem(str(item['port'])))
+        self.table.setItem(row, 2, QTableWidgetItem(item['country']))
+        self.table.setItem(row, 3, NumericTableWidgetItem(f"{item.get('latency', 0):.2f}"))
+        self.table.setItem(row, 4, NumericTableWidgetItem(f"{item.get('download_speed', 0):.2f}"))
+        if not is_batch: self.table.scrollToBottom()
+
+    def update_table_with_results(self, results):
+        self.table.setRowCount(0)
+        self.table.setSortingEnabled(False)
+        for item in results:
+            self.add_result_to_table(item, is_batch=True)
+        self.table.setSortingEnabled(True)
+
+    def update_country_stats(self, results):
+        self.country_table.setRowCount(0)
+        self.country_table.setSortingEnabled(False)
+        stats = defaultdict(lambda: {'count': 0, 'latencies': [], 'speeds': []})
+        for item in results:
+            country = item['country']
+            stats[country]['count'] += 1
+            if 'latency' in item: stats[country]['latencies'].append(item['latency'])
+            if 'download_speed' in item: stats[country]['speeds'].append(item['download_speed'])
+        
+        for country, data in sorted(stats.items()):
+            avg_latency = sum(data['latencies']) / len(data['latencies']) if data['latencies'] else 0
+            avg_speed = sum(data['speeds']) / len(data['speeds']) if data['speeds'] else 0
+            row = self.country_table.rowCount()
+            self.country_table.insertRow(row)
+            self.country_table.setItem(row, 0, QTableWidgetItem(country))
+            self.country_table.setItem(row, 1, NumericTableWidgetItem(str(data['count'])))
+            self.country_table.setItem(row, 2, NumericTableWidgetItem(f"{avg_latency:.2f}"))
+            self.country_table.setItem(row, 3, NumericTableWidgetItem(f"{avg_speed:.2f}"))
+        self.country_table.setSortingEnabled(True)
+
+    def copy_ip_from_table(self, row, col):
+        ip = self.table.item(row, 0).text()
+        port = int(float(self.table.item(row, 1).text()))
+        clipboard_text = format_ip_port(ip, port)
+        QApplication.clipboard().setText(clipboard_text)
+        self.show_status(f"已复制: {clipboard_text}")
+
+    def select_country_from_table(self, row, col):
+        country = self.country_table.item(row, 0).text()
+        for c, cb in self.country_checkboxes.items():
+            cb.setChecked(c == country)
+        self.show_status(f"已自动选择国家: {country}")
+
+    def clear_results(self, clear_log=True):
+        self.current_results = []
         self.table.setRowCount(0)
         self.country_table.setRowCount(0)
-        self.log_edit.clear()
-        self.reset_progress()
-
+        self.update_progress(0, 1)
+        if clear_log: self.statusBar().clearMessage() # Assuming no separate log widget
+    
     def export_results(self):
-        data_to_export = self.results if self.results else self.latency_results
-        if not data_to_export:
-            QMessageBox.warning(self, "提示", "没有可导出的结果。")
+        if not self.current_results:
+            QMessageBox.warning(self, "提示", "没有结果可以导出。")
+            return
+        
+        path, _ = QFileDialog.getSaveFileName(self, "导出结果", "results.txt", "Text Files (*.txt)")
+        if not path:
             return
 
-        countries = split_countries(self.country_input.text())
-        topn_each = self.topn_input.value()
-
-        export_items = export_grouped_by_country(data_to_export, countries, topn_each)
-
-        if not export_items:
-            QMessageBox.warning(self, "提示", "没有符合筛选条件的结果。")
-            return
-
-        save_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "保存结果",
-            "country_speed_result.txt",
-            "Text Files (*.txt)"
-        )
-        if not save_path:
-            return
-
-        grouped = defaultdict(list)
-        for item in export_items:
-            grouped[item["country"]].append(item)
-
-        with open(save_path, "w", encoding="utf-8") as f:
-            for country in grouped:
-                f.write(f"===== {country} =====\n")
-                for item in grouped[country]:
-                    ip_port = format_ip_port(item["ip"], item["port"])
-                    speed = item.get("download_speed", 0.0)
-                    if speed > 0:
-                        line = f"{ip_port}#{item['country']}+{speed:.2f}MB/s"
-                    else:
-                        line = f"{ip_port}#{item['country']}+{item['latency']:.2f}ms"
-                    f.write(line + "\n")
-                f.write("\n")
-
-        QMessageBox.information(self, "完成", f"已导出 {len(export_items)} 条结果到：\n{save_path}")
+        with open(path, 'w', encoding='utf-8') as f:
+            for item in self.current_results:
+                line = f"{format_ip_port(item['ip'], item['port'])}#({item['country']}) " \
+                       f"Delay: {item.get('latency', 'N/A'):.2f}ms, " \
+                       f"Speed: {item.get('download_speed', 'N/A'):.2f}MB/s\n"
+                f.write(line)
+        self.show_status(f"结果已导出到 {path}")
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
