@@ -2,8 +2,8 @@ name: 打包成EXE
 
 on:
   push:
-    tags: ['v*']                    # 打 tag 如 v1.0 时自动打包
-  workflow_dispatch:                 # 也可以手动点击运行
+    tags: ['v*']                    # 打 tag（如 v1.0）时自动打包
+  workflow_dispatch:                 # 手动触发
 
 jobs:
   build:
@@ -24,11 +24,9 @@ jobs:
           pip install PyQt5 requests pyinstaller
 
       - name: 打包成单个EXE
-        run: |
-          pyinstaller --onefile ^
-                      --windowed ^
-                      --name "CF国家分组测速工具" ^
-                      cf_speed_tool_advanced.py
+        run: pyinstaller --onefile --windowed --name "CF国家分组测速工具" cf_speed_tool_advanced.py
+        # 如果你有 icon.ico 文件，可以加上下面这行（去掉前面的 #）：
+        # run: pyinstaller --onefile --windowed --name "CF国家分组测速工具" --icon=icon.ico cf_speed_tool_advanced.py
 
       - name: 上传EXE（供下载）
         uses: actions/upload-artifact@v4
