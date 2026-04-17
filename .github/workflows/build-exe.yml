@@ -1,47 +1,35 @@
-name: 打包成EXE
+name: Build Windows EXE
 
 on:
   push:
-    tags: ['v*']                    # 打 tag（如 v1.0）时自动打包
-  workflow_dispatch:                 # 手动触发
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      - name: 拉取代码
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: 设置 Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: 安装依赖和 PyInstaller
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PyQt5 requests pyinstaller
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-      - name: 打包成单个EXE
-        run: pyinstaller --onefile --windowed --name "CF国家分组测速工具" cf_speed_tool_advanced.py
-        # 如果你有 icon.ico 文件，可以加上下面这行（去掉前面的 #）：
-        # run: pyinstaller --onefile --windowed --name "CF国家分组测速工具" --icon=icon.ico cf_speed_tool_advanced.py
+      - name: Build EXE
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name CountrySpeedGUI --hidden-import PyQt5.QtCore --hidden-import PyQt5.QtGui --hidden-import PyQt5.QtWidgets advanced_country_speed_gui.py
 
-      - name: 上传EXE（供下载）
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CF-Speed-Tool-EXE
-          path: dist/CF国家分组测速工具.exe
-
-      - name: 创建 Release 并上传EXE
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/CF国家分组测速工具.exe
-          tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: CountrySpeedGUI
+          path: dist/CountrySpeedGUI.exe
