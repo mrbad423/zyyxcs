@@ -759,7 +759,7 @@ class SpeedTestWorker(QThread):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("国家分组测速工具 - 效率稳定增强版")
+        self.setWindowTitle("国家分组测速工具 - 最终修正版")
         self.resize(1350, 920)
 
         self.all_targets = []
@@ -785,7 +785,7 @@ class MainWindow(QWidget):
         main_layout.setSpacing(12)
         main_layout.setContentsMargins(14, 14, 14, 14)
 
-        title = QLabel("国家分组测速工具 - 效率稳定增强版")
+        title = QLabel("国家分组测速工具 - 最终修正版")
         title.setObjectName("titleLabel")
         title.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(title)
@@ -805,7 +805,7 @@ class MainWindow(QWidget):
 
         row2 = QHBoxLayout()
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("输入TXT链接，例如：https://zip.cm.edu.kg/all.txt")
+        self.url_edit.setPlaceholderText("输入TXT链接，例如：https://example.com/all.txt")
         btn_load_url = QPushButton("加载TXT链接")
         btn_load_url.clicked.connect(self.load_url_text)
         row2.addWidget(QLabel("TXT链接:"))
@@ -1598,9 +1598,16 @@ class MainWindow(QWidget):
 
         export_items = []
         target_countries = countries if countries else sorted(grouped.keys())
+
         for country in target_countries:
             items = grouped.get(country, [])
+
             if self.results:
+                items = [
+                    x for x in items
+                    if float(x.get("download_speed", 0.0) or 0.0) > 0
+                ]
+
                 items.sort(
                     key=lambda x: (x.get("score", 0.0), x.get("download_speed", 0.0)),
                     reverse=True
@@ -1610,9 +1617,23 @@ class MainWindow(QWidget):
 
             if topn_each > 0:
                 items = items[:topn_each]
+
             export_items.extend(items)
 
+            if self.results:
+                self.append_log(
+                    f"导出国家 {country}：测速成功 {len(items)} 条"
+                    + (f"（按每国前 {topn_each} 条）" if topn_each > 0 else "（全部导出）")
+                )
+            else:
+                self.append_log(
+                    f"导出国家 {country}：延迟结果 {len(items)} 条"
+                    + (f"（按每国前 {topn_each} 条）" if topn_each > 0 else "（全部导出）")
+                )
+
         if not export_items:
+            if self.results:
+                return None, "没有符合条件的测速成功结果可导出。"
             return None, "没有符合筛选条件的结果。"
 
         return export_items, None
