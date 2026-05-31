@@ -334,13 +334,22 @@ def ensure_txt_filename(name: str):
 
 def build_export_text(items):
     lines = []
+    country_totals = defaultdict(int)
+    country_indexes = defaultdict(int)
+
     for item in items:
-        raw_line = item.get("raw_line", "").strip()
-        if raw_line:
-            lines.append(raw_line)
-        else:
-            ip_port = format_ip_port(item["ip"], item["port"])
-            lines.append(f"{ip_port}#{item.get('country', 'UNKNOWN')}")
+        country = item.get("country", "UNKNOWN").upper()
+        country_totals[country] += 1
+
+    for item in items:
+        country = item.get("country", "UNKNOWN").upper()
+        country_indexes[country] += 1
+        label = country
+        if country_totals[country] > 1:
+            label = f"{country}{country_indexes[country]}"
+
+        ip_port = format_ip_port(item["ip"], item["port"])
+        lines.append(f"{ip_port}#{label}")
     return "\n".join(lines) + "\n"
 
 
